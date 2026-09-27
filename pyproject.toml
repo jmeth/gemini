@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "so101-web"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "websockets>=12.0",
+    "pyserial>=3.5",
+    "opencv-python>=4.9",
+    "feetech-servo-sdk>=1.0.0",
+    "vosk>=0.3.45; sys_platform == 'linux'",  # voice listener shells out to arecord (Pi only)
+]
+
+[project.optional-dependencies]
+# Object detection. Heavy (ultralytics pulls torch), so it is opt-in: install
+# with `pip install -e .[vision]` or `make install-vision` only on a rig that
+# needs pick-and-place. torch is used only to export the NCNN weights once;
+# inference then runs through ncnn.
+vision = [
+    "ultralytics>=8.3",
+    "ncnn>=1.0",
+]
+
+[project.scripts]
+so101 = "backend.main:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend"]

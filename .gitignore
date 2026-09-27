@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# Node / frontend
+frontend/node_modules/
+frontend/dist/
+
+# make dev/start process management
+.pids/
+.logs/
+
+# Downloaded / exported models (fetched by `make voice-model`, `make vision-model`)
+models/
+
+# Per-rig runtime state — written back by the app, not portable between machines
+settings.json
+calibration/*.json
+so101.db
+recordings/*.json
+
+# OS / editor
+.DS_Store
+*.swp
