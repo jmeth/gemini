@@ -264,6 +264,25 @@ class FeetechBus:
                                self._packet_handler.getTxRxResult(result))
             writer.clearParam()
 
+    def configure_responsive(self) -> None:
+        """
+        Make the follower track commands promptly.
+
+        Acceleration 254 removes the servo's soft-start ramp, which otherwise
+        reads as lag however fast commands arrive. Return_Delay_Time 0 drops the
+        default 500 us wait before every status reply, which adds up across the
+        reads on this bus. The delay lives in EEPROM, so the lock is released
+        for the write; the caller re-applies torque (and the lock) afterwards.
+        """
+        if not self._connected:
+            raise RuntimeError("Not connected")
+        with self._lock:
+            for name in MOTOR_NAMES:
+                mid = MOTOR_IDS[name]
+                self._write(mid, "Lock", 0)
+                self._write(mid, "Return_Delay_Time", 0)
+                self._write(mid, "Acceleration", 254)
+
     def set_torque(self, motor_name: str, enabled: bool) -> None:
         mid = MOTOR_IDS[motor_name]
         with self._lock:

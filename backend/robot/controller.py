@@ -77,6 +77,9 @@ class RobotController:
         loop = asyncio.get_event_loop()
         try:
             await loop.run_in_executor(None, self._bus.connect)
+            # Before torque: the EEPROM write needs the lock released, and
+            # set_torque_all below puts the lock back.
+            await loop.run_in_executor(None, self._bus.configure_responsive)
             # Enable torque on all motors to take control
             await loop.run_in_executor(None, self._bus.set_torque_all, True)
             self.status = RobotStatus(connected=True)

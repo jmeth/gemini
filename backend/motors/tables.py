@@ -4,9 +4,11 @@
 
 # (address, size_bytes)
 CONTROL_TABLE = {
-    # EPROM — read-only here, used for diagnostics. A servo enforces its own
+    # EPROM — mostly read-only here, used for diagnostics (Return_Delay_Time is
+    # written once on follower connect). A servo enforces its own
     # angle limits, so a joint can refuse to reach a position our calibration
     # thinks is legal, and the only symptom is a tracking error that never closes.
+    "Return_Delay_Time":   (7, 1),
     "Min_Angle_Limit":     (9, 2),
     "Max_Angle_Limit":     (11, 2),
     "Max_Torque_Limit":    (16, 2),

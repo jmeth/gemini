@@ -351,11 +351,14 @@ class TeleopController:
                     # against the follower's measured position instead would
                     # quantise a 50 Hz command stream to the 10 Hz poll rate and
                     # step the arm along in visible staircases.
-                    prev_pos = prev_positions.get(name, target)
-                    max_change = 180.0 * self.status.speed_limit * TELEOP_INTERVAL
-                    delta = target - prev_pos
-                    if abs(delta) > max_change:
-                        target = prev_pos + (max_change if delta > 0 else -max_change)
+                    # At 100% there is no limit: capping at 180 deg/s there still
+                    # lagged any brisk hand movement.
+                    if self.status.speed_limit < 1.0:
+                        prev_pos = prev_positions.get(name, target)
+                        max_change = 180.0 * self.status.speed_limit * TELEOP_INTERVAL
+                        delta = target - prev_pos
+                        if abs(delta) > max_change:
+                            target = prev_pos + (max_change if delta > 0 else -max_change)
 
                     # Collected and written as one packet after the loop.
                     commands[name] = target
