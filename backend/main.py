@@ -211,7 +211,9 @@ async def get_ports():
 
 @app.get("/system/cameras")
 async def get_cameras():
-    return list_cameras()
+    # Opening the picker rescans. Blocking probe, so off the event loop — it
+    # shares that loop with the 50 Hz teleop.
+    return await asyncio.get_event_loop().run_in_executor(None, lambda: list_cameras(refresh=True))
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +378,12 @@ async def rig_status():
     """
     cfg = config.get()
     saved = CalibrationStateMachine.list_calibrations()
+    # Camera validity may enumerate devices; keep that off the event loop.
+    loop = asyncio.get_event_loop()
+    overhead_valid, ee_valid = await loop.run_in_executor(None, lambda: (
+        cfg.camera_overhead is None or is_capture_device(cfg.camera_overhead),
+        cfg.camera_ee is None or is_capture_device(cfg.camera_ee),
+    ))
     return {
         "follower": {
             "connected": robot.status.connected,
@@ -394,8 +402,8 @@ async def rig_status():
         "cameras": {
             "overhead": cfg.camera_overhead,
             "ee": cfg.camera_ee,
-            "overhead_valid": cfg.camera_overhead is None or is_capture_device(cfg.camera_overhead),
-            "ee_valid": cfg.camera_ee is None or is_capture_device(cfg.camera_ee),
+            "overhead_valid": overhead_valid,
+            "ee_valid": ee_valid,
         },
         "calibrations": saved,
     }
@@ -874,7 +882,7 @@ async def camera_stream(index: int):
     MJPEG stream. Every viewer shares one capture; the frame is encoded once
     and the same bytes go to all of them.
     """
-    if not is_capture_device(index):
+    if not await asyncio.get_event_loop().run_in_executor(None, is_capture_device, index):
         return JSONResponse(
             {"error": f"/dev/video{index} is not a video capture device"},
             status_code=404,
@@ -914,7 +922,7 @@ async def camera_stream(index: int):
 @app.get("/camera/{index}/snapshot")
 async def camera_snapshot(index: int):
     """One JPEG — used for picker previews, and cheap while the device lingers."""
-    if not is_capture_device(index):
+    if not await asyncio.get_event_loop().run_in_executor(None, is_capture_device, index):
         return JSONResponse(
             {"error": f"/dev/video{index} is not a video capture device"},
             status_code=404,
@@ -940,7 +948,8 @@ async def camera_snapshot(index: int):
 @app.get("/camera/status")
 async def camera_status():
     """What each opened camera is doing, plus the devices actually available."""
-    return {"streams": cameras.status(), "available": list_cameras()}
+    available = await asyncio.get_event_loop().run_in_executor(None, list_cameras)
+    return {"streams": cameras.status(), "available": available}
 
 
 # ---------------------------------------------------------------------------

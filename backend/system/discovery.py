@@ -18,7 +18,7 @@ def list_serial_ports() -> list[str]:
     return sorted(result)
 
 
-def list_cameras() -> list[dict]:
+def list_cameras(refresh: bool = False) -> list[dict]:
     """
     Video capture devices, as {index, path, label, driver}.
 
@@ -26,4 +26,4 @@ def list_cameras() -> list[dict]:
     rather than opening every index and hoping. Metadata nodes and the Pi's
     codec/ISP nodes open fine but never produce a frame, so they are excluded.
     """
-    return _list_cameras()
+    return _list_cameras(refresh=refresh)

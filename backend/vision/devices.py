@@ -16,6 +16,8 @@ import glob
 import logging
 import platform
 import re
+import threading
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -100,15 +102,32 @@ def _list_probing() -> list[dict]:
     return found
 
 
-def list_cameras() -> list[dict]:
-    """Video capture devices only, as {index, path, label, driver}."""
-    try:
-        if platform.system() == "Linux":
-            return _list_linux()
-        return _list_probing()
-    except Exception as exc:
-        logger.warning("Camera enumeration failed: %s", exc)
-        return []
+# Enumeration is slow on macOS (it opens every index) and the header asks about
+# camera validity every couple of seconds. Probing that often blocked the event
+# loop for ~1 s per poll and stalled teleop, so results are reused briefly.
+CAMERA_CACHE_TTL = 30.0
+_cache_lock = threading.Lock()
+_cache: tuple[float, list[dict]] | None = None
+
+
+def list_cameras(refresh: bool = False) -> list[dict]:
+    """
+    Video capture devices only, as {index, path, label, driver}.
+
+    Cached for CAMERA_CACHE_TTL seconds; pass refresh=True (a user opening the
+    camera picker) to rescan now. Blocking — call from a thread, not the event loop.
+    """
+    global _cache
+    with _cache_lock:
+        if not refresh and _cache and time.monotonic() - _cache[0] < CAMERA_CACHE_TTL:
+            return list(_cache[1])
+        try:
+            found = _list_linux() if platform.system() == "Linux" else _list_probing()
+        except Exception as exc:
+            logger.warning("Camera enumeration failed: %s", exc)
+            return list(_cache[1]) if _cache else []
+        _cache = (time.monotonic(), found)
+        return list(found)
 
 
 def device_path(index: int) -> str | int:
