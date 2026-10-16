@@ -14,6 +14,7 @@ dependencies = [
     "opencv-python>=4.9",
     "feetech-servo-sdk>=1.0.0",
     "vosk>=0.3.45; sys_platform == 'linux'",  # voice listener shells out to arecord (Pi only)
+    "hidapi>=0.15.0",
 ]
 
 [project.optional-dependencies]

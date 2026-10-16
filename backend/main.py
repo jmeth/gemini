@@ -20,6 +20,7 @@ from backend.robot.controller import RobotController
 from backend.robot.calibration import CalibrationStateMachine, CalibrationStep
 from backend.robot.teleop import TeleopController
 from backend.robot.recordings import RecordingController
+from backend.arcade.listener import ArcadeListener
 from backend.commands import registry as commands_registry
 from backend.commands.executor import match_command
 from backend.voice.listener import VoiceListener
@@ -115,6 +116,27 @@ async def _handle_voice_transcript(text: str) -> None:
         voice.status.last_action = f"“{text}” → {cmd['name']} — no take bound"
 
 
+async def _handle_arcade_press(button: int) -> None:
+    """An arcade button went down: play the take bound to it, if there is one."""
+    cmd = await _run(lambda: commands_registry.command_for_button(button))
+    if cmd is None:
+        arcade_note["last_action"] = f"Button {button + 1} — nothing bound"
+        return
+    if not cmd.get("recording_id"):
+        arcade_note["last_action"] = f"Button {button + 1} → {cmd['name']} — no take bound"
+        return
+    try:
+        await recorder.play(cmd["recording_id"], 1.0)
+        arcade_note["last_action"] = f"Button {button + 1} → {cmd['name']} — playing"
+    except RuntimeError as exc:
+        # Most often "Already playing": a press mid-take is ignored, not queued.
+        arcade_note["last_action"] = f"Button {button + 1} → {cmd['name']} — {exc}"
+
+
+arcade_note: dict[str, str | None] = {"last_action": None}
+arcade = ArcadeListener(on_press=_handle_arcade_press)
+
+
 def _voice_grammar_phrases() -> list[str]:
     """
     Trigger phrases of every enabled command — the vocabulary the backend
@@ -169,7 +191,9 @@ async def lifespan(app: FastAPI):
             await voice.start(cfg.voice_mic)
         except Exception as exc:
             logger.warning("Backend voice auto-start failed: %s", exc)
+    arcade.start()
     yield
+    arcade.stop()
     cameras.close_all()
     await voice.stop()
     await recorder.cancel_all()
@@ -1117,11 +1141,33 @@ async def commands_list():
     return await _run(commands_registry.list_commands)
 
 
+def _button_or_none(value) -> int | None:
+    """An arcade button index from a request body; null clears the binding."""
+    if value is None or value == "":
+        return None
+    return int(value)
+
+
+@app.get("/arcade/status")
+async def arcade_status():
+    s = arcade.status
+    return {
+        "connected": s.connected,
+        "device": s.device,
+        "error": s.error,
+        "last_button": s.last_button,
+        "last_press_at": s.last_press_at,
+        "press_seq": s.press_seq,
+        "last_action": arcade_note["last_action"],
+    }
+
+
 @app.post("/commands")
 async def commands_create(body: dict):
     cmd = await _run(lambda: commands_registry.create_command(
         body.get("name", ""), body.get("triggers", []), body.get("recording_id"),
         enabled=bool(body.get("enabled", True)),
+        button=_button_or_none(body.get("button")),
     ))
     await _run(voice.refresh_grammar)
     return cmd
@@ -1138,6 +1184,8 @@ async def commands_update(cmd_id: int, body: dict):
         kwargs["recording_id"] = body["recording_id"]
     if "enabled" in body:
         kwargs["enabled"] = bool(body["enabled"])
+    if "button" in body:
+        kwargs["button"] = _button_or_none(body["button"])
     cmd = await _run(lambda: commands_registry.update_command(cmd_id, **kwargs))
     if cmd is None:
         return JSONResponse({"error": "Not found"}, status_code=404)

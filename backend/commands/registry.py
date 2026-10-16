@@ -47,6 +47,9 @@ def _db() -> sqlite3.Connection:
             _conn.execute(
                 "ALTER TABLE commands ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1"
             )
+        # Migration: add `button` (an arcade button index) the same way.
+        if "button" not in cols:
+            _conn.execute("ALTER TABLE commands ADD COLUMN button INTEGER")
         _conn.commit()
         logger.info("Command registry ready at %s", DB_PATH)
     return _conn
@@ -73,7 +76,18 @@ def _row(r: sqlite3.Row) -> dict:
         "recording_id": r["recording_id"],
         "created_at": r["created_at"],
         "enabled": bool(r["enabled"]),
+        "button": r["button"],
     }
+
+
+def command_for_button(button: int) -> dict | None:
+    """The enabled command bound to this arcade button, if any."""
+    with _lock:
+        r = _db().execute(
+            "SELECT * FROM commands WHERE button = ? AND enabled = 1 ORDER BY id LIMIT 1",
+            (button,),
+        ).fetchone()
+    return _row(r) if r else None
 
 
 def list_commands() -> list[dict]:
@@ -91,17 +105,18 @@ def get_command(cmd_id: int) -> dict | None:
 
 
 def create_command(name: str, triggers, recording_id: str | None,
-                   enabled: bool = True) -> dict:
+                   enabled: bool = True, button: int | None = None) -> dict:
     with _lock:
         cur = _db().execute(
-            "INSERT INTO commands (name, triggers, recording_id, created_at, enabled) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO commands (name, triggers, recording_id, created_at, enabled, button) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
             (
                 (name or "").strip() or "command",
                 json.dumps(_clean_triggers(triggers)),
                 recording_id or None,
                 _now(),
                 1 if enabled else 0,
+                button,
             ),
         )
         _db().commit()
@@ -119,6 +134,7 @@ def update_command(
     triggers=None,
     recording_id=_UNSET,
     enabled: bool | None = None,
+    button=_UNSET,
 ) -> dict | None:
     existing = get_command(cmd_id)
     if not existing:
@@ -127,11 +143,13 @@ def update_command(
     new_triggers = existing["triggers"] if triggers is None else _clean_triggers(triggers)
     new_rec = existing["recording_id"] if recording_id is _UNSET else (recording_id or None)
     new_enabled = existing["enabled"] if enabled is None else bool(enabled)
+    new_button = existing["button"] if button is _UNSET else button
     with _lock:
         _db().execute(
-            "UPDATE commands SET name = ?, triggers = ?, recording_id = ?, enabled = ? "
-            "WHERE id = ?",
-            (new_name, json.dumps(new_triggers), new_rec, 1 if new_enabled else 0, cmd_id),
+            "UPDATE commands SET name = ?, triggers = ?, recording_id = ?, enabled = ?, "
+            "button = ? WHERE id = ?",
+            (new_name, json.dumps(new_triggers), new_rec, 1 if new_enabled else 0,
+             new_button, cmd_id),
         )
         _db().commit()
     return get_command(cmd_id)

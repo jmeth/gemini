@@ -18,8 +18,12 @@
     startVoicePolling, stopVoicePolling,
   } from '../../stores/voice'
 
-  onMount(() => { startRecPolling(); loadCommands(); startVoicePolling() })
-  onDestroy(() => { stopRecPolling(); stopVoicePolling() })
+  import {
+    arcade, buttonLabel, waitForButton, startArcadePolling, stopArcadePolling,
+  } from '../../stores/arcade'
+
+  onMount(() => { startRecPolling(); loadCommands(); startVoicePolling(); startArcadePolling() })
+  onDestroy(() => { stopRecPolling(); stopVoicePolling(); stopArcadePolling() })
 
   // ---- Voice input source -------------------------------------------------
   // Source and mic device are configured in Settings; this workspace only
@@ -97,6 +101,8 @@
   let cName = ''
   let triggerText = ''
   let recordingId = ''
+  let button: number | null = null
+  let learning = false
   let cBusy = false
   let cConfirm: number | null = null
 
@@ -104,7 +110,7 @@
     id ? ($takes.find(t => t.id === id)?.name ?? id) : null
 
   function resetCmd() {
-    editId = null; cName = ''; triggerText = ''; recordingId = ''
+    editId = null; cName = ''; triggerText = ''; recordingId = ''; button = null; learning = false
   }
 
   function editCmd(c: typeof $commands[number]) {
@@ -112,16 +118,25 @@
     cName = c.name
     triggerText = c.triggers.join(', ')
     recordingId = c.recording_id ?? ''
+    button = c.button ?? null
+  }
+
+  async function learnButton() {
+    learning = true
+    const pressed = await waitForButton()
+    learning = false
+    if (pressed !== null) button = pressed
+    else commandNote.set('No button press heard — is the arcade encoder connected?')
   }
 
   async function saveCmd() {
     const triggers = triggerText.split(',').map(s => s.trim()).filter(Boolean)
-    if (!cName.trim() || triggers.length === 0) {
-      commandNote.set('A command needs a name and at least one trigger phrase')
+    if (!cName.trim() || (triggers.length === 0 && button === null)) {
+      commandNote.set('A command needs a name and either a trigger phrase or an arcade button')
       return
     }
     cBusy = true
-    const body = { name: cName.trim(), triggers, recording_id: recordingId || null }
+    const body = { name: cName.trim(), triggers, recording_id: recordingId || null, button }
     const ok = editId == null
       ? await createCommand(body)
       : await updateCommand(editId, body)
@@ -325,6 +340,7 @@
             <div class="cinfo">
               <span class="cname">{c.name}</span>
               <span class="chips">
+                {#if c.button !== null}<span class="chip btn-chip">🕹 {buttonLabel(c.button)}</span>{/if}
                 {#each c.triggers as t}<span class="chip">{t}</span>{/each}
               </span>
               <span class="bound">
@@ -347,7 +363,24 @@
 
     <div class="sub">{editId == null ? 'New command' : 'Edit command'}</div>
     <input class="text" placeholder="Name (e.g. grab red block)" bind:value={cName} />
-    <input class="text" placeholder="Trigger phrases, comma separated" bind:value={triggerText} />
+    <input class="text" placeholder="Trigger phrases, comma separated (optional with a button)" bind:value={triggerText} />
+    <div class="btnrow">
+      <span class="btnlabel">
+        {#if learning}Press an arcade button…
+        {:else if button !== null}🕹 {buttonLabel(button)}
+        {:else}No arcade button{/if}
+      </span>
+      <button class="btn sm" on:click={learnButton} disabled={learning || !$arcade.connected}
+        title={$arcade.connected ? 'Press a button on the arcade panel to assign it' : 'Arcade encoder not connected'}>
+        {button === null ? 'Assign' : 'Change'}
+      </button>
+      {#if button !== null && !learning}
+        <button class="btn sm" on:click={() => (button = null)}>Clear</button>
+      {/if}
+    </div>
+    {#if $arcade.last_action}
+      <p class="hint dim">Last arcade press: {$arcade.last_action}</p>
+    {/if}
     <select class="text" bind:value={recordingId}>
       <option value="">— no take —</option>
       {#each $takes as t (t.id)}
@@ -605,6 +638,9 @@
     background: #13282c; border: 1px solid #1f4248;
     border-radius: 3px; padding: 1px 5px;
   }
+  .chip.btn-chip { color: #f0d9a0; background: #2a2412; border-color: #4a3f1c; }
+  .btnrow { display: flex; align-items: center; gap: 8px; }
+  .btnlabel { flex: 1; font-size: 12px; color: #9aa7b2; }
   .bound { font-size: 10px; color: #55606a; }
   .bound i { color: #444; }
 

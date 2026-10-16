@@ -21,6 +21,7 @@ export default defineConfig({
       '/vision':     'http://localhost:8000',
       '/recordings': 'http://localhost:8000',
       '/commands':   'http://localhost:8000',
+      '/arcade':     'http://localhost:8000',
     },
   },
   build: {

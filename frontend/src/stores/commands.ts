@@ -8,6 +8,8 @@ export interface Command {
   recording_id: string | null
   created_at: string
   enabled: boolean
+  /** Arcade button (0-based) that plays this command, if any. */
+  button: number | null
 }
 
 export const commands = writable<Command[]>([])

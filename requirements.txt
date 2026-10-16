@@ -8,6 +8,7 @@ click==8.4.2
 fastapi==0.141.1
 feetech-servo-sdk==1.0.0
 h11==0.16.0
+hidapi==0.15.0
 httptools==0.8.0
 idna==3.19
 numpy==2.5.2
