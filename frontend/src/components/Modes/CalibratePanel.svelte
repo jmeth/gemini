@@ -100,8 +100,20 @@
     await loadArms()
   }
 
+  async function cancel() {
+    try {
+      const res = await fetch(`/robot/calibrate/cancel?arm_name=${armName}`, { method: 'POST' })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) { note = data.error ?? `Request failed (${res.status})`; return }
+      note = null
+    } catch {
+      note = 'Could not reach the backend'
+    }
+    await refresh()
+  }
+
   function selectArm(name: string) {
-    if (status.active) return   // don't switch arms mid-run
+    if (running) return   // don't switch arms mid-run
     armName = name
     positions = {}
     note = null
@@ -111,7 +123,10 @@
   $: selected = arms.find(a => a.name === armName)
   $: currentPos = status.motor ? positions[status.motor] : undefined
   $: progressPct = (status.progress[0] / status.progress[1]) * 100
-  $: canStart = !!selected?.connected && !status.active
+  // A finished run still reports active, but nothing is in progress — the picker
+  // and Start button must come back so the other arm (or a redo) can be run.
+  $: running = status.active && status.step !== 'complete'
+  $: canStart = !!selected?.connected && !running
 </script>
 
 <div class="panel">
@@ -151,7 +166,7 @@
         {selected.label} is not connected, so its joints cannot be read.
         Connect it from the <em>{selected.name}</em> dot in the header first.
       </p>
-    {:else if selected?.calibrated && !status.active}
+    {:else if selected?.calibrated && !running}
       <p class="hint">Running this again replaces {selected.label}'s saved calibration.</p>
     {/if}
   </div>
@@ -183,17 +198,21 @@
   </div>
 
   <div class="actions">
-    {#if !status.active}
-      <button class="primary" on:click={start} disabled={!canStart}>
-        Calibrate {selected?.label ?? ''}
-      </button>
-    {:else if status.step !== 'complete'}
+    {#if running}
       <button class="primary" on:click={confirm}>
         Confirm Position
       </button>
+      <button class="secondary" on:click={cancel}>
+        Cancel (keep existing)
+      </button>
     {:else}
-      <button class="success" disabled>
-        ✓ Calibration Complete
+      {#if status.step === 'complete'}
+        <button class="success" disabled>
+          ✓ {selected?.label ?? ''} Calibration Complete
+        </button>
+      {/if}
+      <button class="primary" on:click={start} disabled={!canStart}>
+        {status.step === 'complete' ? 'Recalibrate' : 'Calibrate'} {selected?.label ?? ''}
       </button>
     {/if}
   </div>
@@ -375,6 +394,17 @@
 
   button.primary:hover {
     background: #2a4a6a;
+  }
+
+  button.secondary {
+    background: transparent;
+    color: #9aa7b2;
+    border: 1px solid #2c343b;
+  }
+
+  button.secondary:hover {
+    background: #1c2227;
+    color: #dfe6ec;
   }
 
   button.success {

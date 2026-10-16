@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 
 import backend.config as config
 from backend.robot.controller import RobotController
-from backend.robot.calibration import CalibrationStateMachine
+from backend.robot.calibration import CalibrationStateMachine, CalibrationStep
 from backend.robot.teleop import TeleopController
 from backend.robot.recordings import RecordingController
 from backend.commands import registry as commands_registry
@@ -573,6 +573,37 @@ async def calibrate_confirm(arm_name: str = "follower"):
             logger.info("Follower calibration reloaded into the controller")
 
     return status
+
+
+@app.post("/robot/calibrate/cancel")
+async def calibrate_cancel(arm_name: str = "follower"):
+    """
+    Abandon an in-progress calibration and keep the saved one. Nothing is written
+    until the last joint is confirmed, so this only drops the run and restores
+    the arm's torque.
+    """
+    if arm_name not in ARMS:
+        return JSONResponse({"error": f"Unknown arm '{arm_name}'"}, status_code=400)
+
+    calibration = calibrations.get(arm_name)
+    if calibration is None or calibration.step in (
+        CalibrationStep.IDLE, CalibrationStep.COMPLETE
+    ):
+        return JSONResponse(
+            {"error": f"No calibration in progress for '{arm_name}'"}, status_code=400
+        )
+
+    del calibrations[arm_name]
+
+    # Start released torque on this arm. The follower must hold position again;
+    # the leader stays passive so it can still be moved by hand for teleop.
+    bus = _arm_bus(arm_name)
+    if arm_name == "follower" and bus is not None:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, bus.set_torque_all, True)
+
+    logger.info("Calibration for '%s' cancelled; keeping the saved calibration", arm_name)
+    return await calibrate_status(arm_name)
 
 
 @app.get("/robot/calibrate/status")
