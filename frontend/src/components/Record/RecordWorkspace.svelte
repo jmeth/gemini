@@ -39,7 +39,8 @@
   let confirmId: string | null = null
   // 'leader'  → recording starts teleop mirroring; the leader drives the motion
   //             and the mirrored follower joints are sampled.
-  // 'hand'    → follower torque is released and the arm is walked through by hand.
+  // 'hand'    → follower torque is released automatically and both arms are moved
+  //             by hand; the leader is recorded alongside the follower.
   let mode: 'leader' | 'hand' = 'leader'
 
   $: st = $recorderStatus

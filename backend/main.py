@@ -666,30 +666,45 @@ async def robot_home():
 
 
 @app.post("/robot/home/set")
-async def robot_set_home():
-    """Save current arm position as home position."""
-    if not robot.status.connected:
-        return JSONResponse({"error": "Not connected"}, status_code=400)
+async def robot_set_home(arm_name: str = "follower"):
+    """Save an arm's current position as its home position."""
+    if arm_name not in ARMS:
+        return JSONResponse({"error": f"Unknown arm '{arm_name}'"}, status_code=400)
 
-    # Read current positions from robot state
+    bus = _arm_bus(arm_name)
+    if bus is None:
+        return JSONResponse(
+            {"error": f"{arm_name.capitalize()} arm is not connected"}, status_code=400
+        )
+
     loop = asyncio.get_event_loop()
-    states = await loop.run_in_executor(None, robot._bus.read_all)
+    raw = await loop.run_in_executor(None, bus.read_positions)
 
-    # Get calibrated positions
+    # A failed bus read comes back empty or short. Saving that would store a
+    # bogus home, so insist on a reading for every joint.
     from backend.motors.tables import MOTOR_NAMES
+    missing = [n for n in MOTOR_NAMES if n not in raw]
+    if missing:
+        return JSONResponse(
+            {"error": f"No reading from {', '.join(missing)} — home not saved"},
+            status_code=502,
+        )
+
+    # Calibrated positions: raw angle plus the arm's zero offset.
+    cal_data = (
+        robot._calibration if arm_name == "follower"
+        else CalibrationStateMachine.load_calibration(arm_name)
+    )
     current_positions = {}
     for name in MOTOR_NAMES:
-        if name in states:
-            raw_pos = states[name].pos_deg
-            # Apply calibration offset to get calibrated position
-            cal = robot._calibration.joints.get(name)
-            calibrated_pos = raw_pos + cal.zero_offset if cal else raw_pos
-            current_positions[name] = round(calibrated_pos, 1)
+        cal = cal_data.joints.get(name)
+        current_positions[name] = round(raw[name] + cal.zero_offset if cal else raw[name], 1)
 
-    # Save as new home
-    CalibrationStateMachine.save_home_positions(current_positions)
+    CalibrationStateMachine.save_home_positions(current_positions, arm_name=arm_name)
+    if arm_name == "follower":
+        robot._calibration.home_positions = current_positions
 
-    return {"ok": True, "positions": current_positions}
+    return {"ok": True, "arm": arm_name, "positions": current_positions}
 
 
 # ---------------------------------------------------------------------------
@@ -1071,7 +1086,14 @@ async def recordings_stop_play():
 @app.post("/recordings/{rec_id}/play")
 async def recordings_play(rec_id: str, body: dict):
     try:
-        await recorder.play(rec_id, body.get("speed", 1.0))
+        # Both default on: skip the take's idle lead-in and finish at home, so
+        # one take flows into the next. {"trim_start": false} / {"return_home":
+        # false} give the raw recording.
+        await recorder.play(
+            rec_id, body.get("speed", 1.0),
+            trim_start=bool(body.get("trim_start", True)),
+            return_home=bool(body.get("return_home", True)),
+        )
     except RuntimeError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
     return {"ok": True}
