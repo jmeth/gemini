@@ -1,6 +1,6 @@
 import { writable } from 'svelte/store'
 
-export const MODES = ['manual', 'teleop', 'record', 'pick'] as const
+export const MODES = ['manual', 'teleop', 'record', 'pick', 'directives'] as const
 export type Mode = typeof MODES[number]
 
 export const MODE_LABELS: Record<Mode, string> = {
@@ -8,6 +8,7 @@ export const MODE_LABELS: Record<Mode, string> = {
   teleop: 'Teleop',
   record: 'Record',
   pick:   'Pick',
+  directives: 'Directives',
 }
 
 export const MODE_HINTS: Record<Mode, string> = {
@@ -15,6 +16,7 @@ export const MODE_HINTS: Record<Mode, string> = {
   teleop: 'Leader arm drives the follower',
   record: 'Capture and replay trajectories',
   pick:   'Vision-guided pick and place',
+  directives: 'Movements, poses, sounds, and rules that trigger them',
 }
 
 /** Modes whose backend is not built yet — the pane says so instead of pretending. */

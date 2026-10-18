@@ -10,9 +10,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import backend.config as config
@@ -21,6 +21,9 @@ from backend.robot.calibration import CalibrationStateMachine, CalibrationStep
 from backend.robot.teleop import TeleopController
 from backend.robot.recordings import RecordingController
 from backend.arcade.listener import ArcadeListener
+from backend.directives import store as directives_store
+from backend.directives.audio import AudioPlayer, available_player
+from backend.directives.engine import DirectivesEngine
 from backend.commands import registry as commands_registry
 from backend.commands.executor import match_command
 from backend.voice.listener import VoiceListener
@@ -92,6 +95,10 @@ robot.leader_provider = teleop.snapshot
 # Recording / playback state rides along on the same frame.
 robot.frame_extras_provider = recorder.snapshot
 
+audio = AudioPlayer()
+directives = DirectivesEngine(recorder, audio, side_provider=lambda: config.get().arm_side)
+recorder.side_provider = lambda: config.get().arm_side
+
 
 async def _run(fn):
     """Run a blocking callable on the default executor."""
@@ -103,6 +110,7 @@ async def _handle_voice_transcript(text: str) -> None:
     A transcript from the backend Vosk listener. Same path the browser takes:
     match it against the command registry, and on a hit play the bound take.
     """
+    await directives.fire({"type": "voice", "text": text})
     cmds = await _run(commands_registry.list_commands)
     cmd, score, _trigger = match_command(text, cmds)
     if cmd is None:
@@ -119,7 +127,13 @@ async def _handle_voice_transcript(text: str) -> None:
 
 
 async def _handle_arcade_press(button: int) -> None:
-    """An arcade button went down: play the take bound to it, if there is one."""
+    """An arcade button went down: run any rules on it, then the older command binding."""
+    await directives.fire({"type": "button", "button": button})
+    await _arcade_press_command(button)
+
+
+async def _arcade_press_command(button: int) -> None:
+    """The older path: play the take bound to this button by a command, if there is one."""
     cmd = await _run(lambda: commands_registry.command_for_button(button))
     if cmd is None:
         arcade_note["last_action"] = f"Button {button + 1} — nothing bound"
@@ -151,6 +165,7 @@ def _voice_grammar_phrases() -> list[str]:
     for cmd in commands_registry.list_commands():
         if cmd.get("enabled", True):
             phrases += cmd.get("triggers", [])
+    phrases += directives.voice_phrases()
     return phrases
 
 
@@ -194,7 +209,9 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             logger.warning("Backend voice auto-start failed: %s", exc)
     arcade.start()
+    directives.start()
     yield
+    await directives.stop()
     arcade.stop()
     cameras.close_all()
     await voice.stop()
@@ -887,6 +904,7 @@ def _emit_detections(index: int, objects: list[dict]) -> None:
     loop = MAIN_LOOP
     if loop is None or loop.is_closed():
         return
+    directives.note_detections(index, objects)
     payload = {"type": "detections", "camera": index, "objects": objects, "t": time.time()}
     loop.call_soon_threadsafe(lambda: asyncio.ensure_future(manager.broadcast_async(payload)))
 
@@ -1302,6 +1320,277 @@ async def pick_objects(height: float = 0.0):
         "table_normal": [round(float(v), 4) for v in _pick_table.normal],
         "objects": out,
     }
+
+
+# ---------------------------------------------------------------------------
+# Directives — poses, sounds, rules, and what the engine did
+# ---------------------------------------------------------------------------
+
+def _bad(exc: Exception, status: int = 400) -> JSONResponse:
+    return JSONResponse({"error": str(exc)}, status_code=status)
+
+
+async def _rules_changed() -> None:
+    """Rules feed the engine and the voice recogniser's vocabulary; refresh both."""
+    await _run(directives.refresh)
+    await _run(voice.refresh_grammar)
+
+
+@app.get("/directives/arms")
+async def directives_arms():
+    cfg = config.get()
+    return {
+        "sides": list(directives_store.SIDES),
+        "side": cfg.arm_side,                 # the arm the connected follower stands for
+        "connected": robot.status.connected,
+        "audio_player": available_player(),
+    }
+
+
+@app.post("/directives/arms")
+async def directives_set_side(body: dict):
+    side = body.get("side")
+    if side not in directives_store.SIDES:
+        return _bad(ValueError("side must be 'left' or 'right'"))
+    config.update({"arm_side": side})
+    return await directives_arms()
+
+
+# -- poses ------------------------------------------------------------------
+
+@app.get("/poses")
+async def poses_list():
+    return await _run(directives_store.list_poses)
+
+
+@app.post("/poses")
+async def poses_create(body: dict):
+    return await _run(lambda: directives_store.create_pose(body.get("name", ""), body.get("arms", {})))
+
+
+@app.post("/poses/capture")
+async def poses_capture(body: dict):
+    """Save where the connected arm is now. With pose_id, add this arm to that pose."""
+    if not robot.status.connected or not robot.last_positions:
+        return _bad(RuntimeError("Follower arm is not connected"))
+    side = config.get().arm_side
+    joints = {n: round(v, 2) for n, v in robot.last_positions.items()}
+
+    def save():
+        if body.get("pose_id") is not None:
+            existing = directives_store.get_pose(int(body["pose_id"]))
+            if existing is None:
+                return None
+            return directives_store.update_pose(existing["id"], arms={**existing["arms"], side: joints})
+        return directives_store.create_pose(body.get("name", ""), {side: joints})
+
+    pose = await _run(save)
+    return pose if pose else JSONResponse({"error": "No such pose"}, status_code=404)
+
+
+@app.put("/poses/{pose_id}")
+async def poses_update(pose_id: int, body: dict):
+    pose = await _run(lambda: directives_store.update_pose(pose_id, body.get("name"), body.get("arms")))
+    return pose if pose else JSONResponse({"error": "Not found"}, status_code=404)
+
+
+@app.delete("/poses/{pose_id}")
+async def poses_delete(pose_id: int):
+    if not await _run(lambda: directives_store.delete_pose(pose_id)):
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return {"ok": True}
+
+
+@app.post("/poses/{pose_id}/go")
+async def poses_go(pose_id: int, body: dict):
+    """Move the connected arm to a pose. The pose must have values for that arm."""
+    pose = await _run(lambda: directives_store.get_pose(pose_id))
+    if pose is None:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    side = config.get().arm_side
+    joints = pose["arms"].get(side)
+    if not joints:
+        return _bad(RuntimeError(f"This pose has no {side} arm values"))
+    try:
+        await recorder.go_to(joints, float(body.get("duration_s", 1.5)), label=pose["name"])
+    except RuntimeError as exc:
+        return _bad(exc)
+    return {"ok": True}
+
+
+# -- sounds -----------------------------------------------------------------
+
+@app.get("/sounds")
+async def sounds_list():
+    return await _run(directives_store.list_sounds)
+
+
+@app.post("/sounds")
+async def sounds_upload(request: Request, name: str = "", filename: str = ""):
+    """Raw-body upload (no multipart dependency): the file's bytes, name and filename in the query."""
+    if int(request.headers.get("content-length") or 0) > directives_store.MAX_SOUND_BYTES:
+        return _bad(ValueError("Sound is too large"), 413)
+    data = await request.body()
+    try:
+        return await _run(lambda: directives_store.create_sound(name, filename, data))
+    except ValueError as exc:
+        return _bad(exc)
+
+
+@app.put("/sounds/{sound_id}")
+async def sounds_rename(sound_id: int, body: dict):
+    sound = await _run(lambda: directives_store.rename_sound(sound_id, body.get("name", "")))
+    return sound if sound else JSONResponse({"error": "Not found"}, status_code=404)
+
+
+@app.delete("/sounds/{sound_id}")
+async def sounds_delete(sound_id: int):
+    if not await _run(lambda: directives_store.delete_sound(sound_id)):
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return {"ok": True}
+
+
+@app.get("/sounds/{sound_id}/file")
+async def sounds_file(sound_id: int):
+    """The audio itself, for previewing in the page."""
+    sound = await _run(lambda: directives_store.get_sound(sound_id))
+    path = directives_store.sound_path(sound) if sound else None
+    if not path or not path.exists():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return FileResponse(path)
+
+
+@app.post("/sounds/stop")
+async def sounds_stop():
+    return {"stopped": await audio.stop()}
+
+
+@app.post("/sounds/{sound_id}/play")
+async def sounds_play(sound_id: int, body: dict):
+    """Play through the robot's own speaker."""
+    sound = await _run(lambda: directives_store.get_sound(sound_id))
+    if sound is None:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    try:
+        await audio.play(directives_store.sound_path(sound), float(body.get("volume", 1.0)))
+    except RuntimeError as exc:
+        return _bad(exc, 503)
+    return {"ok": True}
+
+
+# -- rules ------------------------------------------------------------------
+
+@app.get("/rules")
+async def rules_list():
+    return await _run(directives_store.list_rules)
+
+
+@app.post("/rules")
+async def rules_create(body: dict):
+    try:
+        rule = await _run(lambda: directives_store.create_rule(body, enabled=bool(body.get("enabled", True))))
+    except ValueError as exc:
+        return _bad(exc)
+    await _rules_changed()
+    return rule
+
+
+@app.put("/rules/{rule_id}")
+async def rules_update(rule_id: int, body: dict):
+    try:
+        rule = await _run(lambda: directives_store.update_rule(rule_id, body))
+    except ValueError as exc:
+        return _bad(exc)
+    if rule is None:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    await _rules_changed()
+    return rule
+
+
+@app.delete("/rules/{rule_id}")
+async def rules_delete(rule_id: int):
+    if not await _run(lambda: directives_store.delete_rule(rule_id)):
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    await _rules_changed()
+    return {"ok": True}
+
+
+@app.post("/rules/{rule_id}/run")
+async def rules_run(rule_id: int):
+    if not directives.run_now(rule_id):
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return {"ok": True}
+
+
+@app.post("/rules/import-commands")
+async def rules_import_commands():
+    """
+    Turn the older voice/button commands into rules, and switch the commands off so a
+    spoken phrase or button press does not run both. Commands with no take bound have
+    nothing to do and are left alone.
+    """
+    def do_import():
+        existing = {r["source"] for r in directives_store.list_rules() if r["source"]}
+        imported = skipped = 0
+        for cmd in commands_registry.list_commands():
+            if f"command:{cmd['id']}" in existing:
+                continue
+            triggers = []
+            if cmd["triggers"]:
+                triggers.append({"type": "voice", "phrases": cmd["triggers"]})
+            if cmd.get("button") is not None:
+                triggers.append({"type": "button", "button": cmd["button"]})
+            if not triggers or not cmd["recording_id"]:
+                skipped += 1
+                continue
+            directives_store.create_rule(
+                {"name": cmd["name"], "triggers": triggers,
+                 "actions": [{"type": "movement", "id": cmd["recording_id"]}]},
+                enabled=cmd["enabled"], source=f"command:{cmd['id']}")
+            commands_registry.update_command(cmd["id"], enabled=False)
+            imported += 1
+        return {"imported": imported, "skipped": skipped}
+
+    result = await _run(do_import)
+    await _rules_changed()
+    return result
+
+
+# -- inputs, as seen by the engine -------------------------------------------
+
+@app.get("/directives/events")
+async def directives_events(after: int = 0):
+    return {"events": directives.events_after(after)}
+
+
+@app.post("/directives/fire")
+async def directives_fire(body: dict):
+    """Simulate an input (button, voice, object, startup) to see which rules it triggers."""
+    kind = body.get("type")
+    if kind not in directives_store.TRIGGER_TYPES or kind == "timer":
+        return _bad(ValueError("type must be button, voice, object or startup"))
+    event = {"type": kind}
+    if kind == "button":
+        event["button"] = int(body.get("button", 0))
+    elif kind == "voice":
+        event["text"] = str(body.get("text", ""))
+    elif kind == "object":
+        event.update(label=str(body.get("label", "")).lower(),
+                     event=body.get("event", "appears"), conf=float(body.get("conf", 1.0)))
+    return {"matched": await directives.fire(event, manual=True)}
+
+
+@app.post("/directives/voice")
+async def directives_voice(body: dict):
+    """A transcript from the browser's speech recogniser."""
+    return {"matched": await directives.fire({"type": "voice", "text": str(body.get("text", ""))})}
+
+
+@app.put("/recordings/{rec_id}")
+async def recordings_rename(rec_id: str, body: dict):
+    if not await _run(lambda: recorder.rename_recording(rec_id, body.get("name", ""))):
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------

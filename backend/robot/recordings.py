@@ -109,6 +109,8 @@ class RecordingController:
         # when the take starts. None for a teleop demo, where the leader is
         # already the source of the follower's motion.
         self._leader_cal = None
+        # Which arm (left/right) the follower stands for; stamped on new takes.
+        self.side_provider = None
         # True while a by-hand take has the follower limp, so stopping knows to
         # take it back.
         self._follower_released = False
@@ -258,6 +260,7 @@ class RecordingController:
             "duration_s": round(duration, 2),
             "hz": RECORD_HZ,
             "arms": ["follower", "leader"] if self._leader_cal is not None else ["follower"],
+            "side": self.side_provider() if self.side_provider else None,
             "frames": self._frames,
         }
         (RECORDINGS_DIR / f"{rec_id}.json").write_text(json.dumps(doc, indent=2))
@@ -324,6 +327,7 @@ class RecordingController:
                 "hz": d.get("hz", RECORD_HZ),
                 "frames": len(d.get("frames", [])),
                 "leader": bool(d.get("frames")) and "leader" in d["frames"][0],
+                "side": d.get("side"),
             })
         out.sort(key=lambda r: r.get("created_at") or "", reverse=True)
         return out
@@ -453,7 +457,8 @@ class RecordingController:
         return 0
 
     async def _ramp_to(self, target: dict[str, float], cal,
-                       leader_target: dict[str, float] | None = None) -> None:
+                       leader_target: dict[str, float] | None = None,
+                       duration: float | None = None) -> None:
         """Glide both arms from where they are now to the targets, at a bounded speed."""
         current = {n: self._follower.last_positions.get(n) for n in target}
         known = {n: v for n, v in current.items() if v is not None}
@@ -465,7 +470,8 @@ class RecordingController:
                    + [abs(leader_target[n] - v) for n, v in lknown.items()] + [0.0])
         if dist < RAMP_SKIP_DEG:
             return
-        duration = max(RAMP_MIN_S, dist / RAMP_DEG_PER_S)
+        if duration is None:
+            duration = max(RAMP_MIN_S, dist / RAMP_DEG_PER_S)
         start = time.monotonic()
         while True:
             f = min(1.0, (time.monotonic() - start) / duration)
@@ -556,6 +562,72 @@ class RecordingController:
                 v = min(max(v, jc.min_pos), jc.max_pos)
             out[n] = v
         return out
+
+    def rename_recording(self, rec_id: str, name: str) -> bool:
+        p = self._path(rec_id)
+        if not p.exists():
+            return False
+        doc = json.loads(p.read_text())
+        doc["name"] = (name or "").strip()[:80] or doc.get("name", rec_id)
+        p.write_text(json.dumps(doc, indent=2))
+        return True
+
+    async def go_to(self, joints: dict[str, float], duration: float = 1.5,
+                    label: str | None = None) -> None:
+        """
+        Move the follower to a pose and return once the move is under way. Shares
+        the playback slot, so it cannot overlap a take, and wait_idle() covers it.
+        """
+        if self.status.recording:
+            raise RuntimeError("Stop recording before moving the arm")
+        if self._play_task:
+            raise RuntimeError("The arm is already moving")
+        if not self._follower.status.connected:
+            raise RuntimeError("Follower arm not connected")
+
+        if self._teleop is not None and self._teleop.status.mirroring:
+            await self._teleop.stop_mirroring()
+        bus = getattr(self._follower, "_bus", None)
+        if bus is not None:
+            loop = asyncio.get_event_loop()
+            # Hold where the arm is before torque comes on, so a limp arm does not
+            # snap to a stale goal on the way.
+            if self._follower.last_positions:
+                await self._follower.set_positions(dict(self._follower.last_positions))
+            await loop.run_in_executor(None, bus.set_torque_all, True)
+
+        self.status.playing = True
+        self.status.play_id = label or "pose"
+        self.status.play_progress = 0.0
+        self.status.error = None
+        self._play_task = asyncio.get_event_loop().create_task(self._goto_loop(joints, duration))
+
+    async def _goto_loop(self, joints: dict[str, float], duration: float) -> None:
+        try:
+            await self._ramp_to({n: v for n, v in joints.items() if n in MOTOR_NAMES},
+                                self._follower._calibration, duration=duration)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Move to pose failed: %s", exc)
+            self.status.error = str(exc)
+        finally:
+            self.status.playing = False
+            self.status.play_id = None
+            self.status.play_progress = 1.0
+            self._play_task = None
+
+    async def wait_idle(self) -> None:
+        """Return when the current take or move has finished (immediately if none)."""
+        task = self._play_task
+        if task is None:
+            return
+        try:
+            await asyncio.wait({task})
+        except asyncio.CancelledError:
+            # The caller was cancelled (a rule interrupted): stop the arm too.
+            await self.stop_play()
+            raise
 
     async def stop_play(self) -> None:
         task = self._play_task

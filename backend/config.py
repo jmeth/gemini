@@ -17,6 +17,9 @@ SETTINGS_PATH = Path(__file__).parent.parent / "settings.json"
 class Settings(BaseModel):
     follower_port: Optional[str] = None   # e.g. "/dev/tty.usbmodem..."
     leader_port:   Optional[str] = None
+    # Which of WALL-E's arms the connected follower stands for ("left" / "right").
+    # Rules, poses and takes name arms; this decides which of them can really move.
+    arm_side: str = "right"
     camera_overhead: Optional[int] = None  # OpenCV device index
     camera_ee:       Optional[int] = None  # end-effector camera
     # Capture tuning — modest by default so the arm's poll loop keeps its CPU

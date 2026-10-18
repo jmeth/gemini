@@ -58,7 +58,7 @@
           <JointConsole {dual} />
         </div>
 
-        {#if $mode !== 'record'}
+        {#if $mode !== 'record' && $mode !== 'directives'}
           <div class="pane">
             {#if $mode === 'manual'}
               <ManualPanel />

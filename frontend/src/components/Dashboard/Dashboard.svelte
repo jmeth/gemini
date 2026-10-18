@@ -6,6 +6,7 @@
   import Arm3D from './Arm3D.svelte'
   import TimePlot from './TimePlot.svelte'
   import RecordWorkspace from '../Record/RecordWorkspace.svelte'
+  import DirectivesWorkspace from '../Directives/DirectivesWorkspace.svelte'
 
   export let mode: Mode = 'manual'
 
@@ -39,6 +40,10 @@
 {#if mode === 'record'}
   <div class="stage record">
     <RecordWorkspace />
+  </div>
+{:else if mode === 'directives'}
+  <div class="stage record">
+    <DirectivesWorkspace />
   </div>
 {:else}
   <div class="stage">

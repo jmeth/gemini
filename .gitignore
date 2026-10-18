@@ -25,3 +25,4 @@ recordings/*.json
 # OS / editor
 .DS_Store
 *.swp
+sounds/

@@ -8,6 +8,9 @@ export interface Take {
   duration_s: number
   hz: number
   frames: number
+  /** Which WALL-E arm the take was recorded on, and whether the leader was captured too. */
+  side?: string | null
+  leader?: boolean
 }
 
 export interface RecorderStatus {

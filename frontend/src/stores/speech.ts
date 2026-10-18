@@ -38,6 +38,12 @@ export function startListening(): void {
     const transcript = (res[0]?.transcript ?? '').trim()
     if (!transcript) return
     heard.set(transcript)
+    // Rules (Directives) listen to what was heard, alongside the older commands.
+    fetch('/directives/voice', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: transcript }),
+    }).catch(() => {})
 
     const m = await matchCommand(transcript)
     if (!m) { lastAction.set(`“${transcript}” — no match`); return }

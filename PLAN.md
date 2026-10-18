@@ -399,6 +399,50 @@ POST /pick                     -> {label: str} or {px, py} -> execute IK pick (n
 - Overlay detected object positions in 3D
 - End-effector trajectory trail
 
+### Directives — rules engine 🔧 FIRST SLICE DONE
+The Directives tab (the Wall-E build's "directives") is where behaviour is authored. The
+three things the UI is for: visualise the rig (Dashboard), set it up (calibrate, ports,
+models, jog joints), and automate it (this tab). Built beside the existing tabs so nothing
+was removed; Record stays until Movements matches it.
+
+Sub-pages: **Movements** (record/replay/rename takes, tagged with the arm they were recorded
+on), **Poses** (named joint positions per arm), **Sounds** (upload, preview, play on the
+robot), **Rules**, **Test bench** (live inputs + fire any input by hand), **Activity**
+(what fired, what was skipped and why).
+
+Rules: `WHEN any trigger  THEN actions in order`.
+- Triggers: voice phrase, arcade button, timer (every N s / daily at HH:MM), object seen
+  (appears/disappears, label + min confidence, debounced over several frames), startup.
+- Actions: play movement, go to pose, play sound (optionally wait), wait.
+- Each movement/pose action names arms (left/right/both). Per rule: busy policy
+  (skip / queue / interrupt) and a cooldown. Sound-only rules never wait on the arm.
+- Voice: the single best-scoring rule fires (two similar phrases cannot both run), and rule
+  phrases join the recogniser's grammar. Browser speech also posts to `/directives/voice`.
+- Existing voice/button commands keep working; "Import existing commands" copies them into
+  rules and switches the old ones off so nothing fires twice.
+
+Decisions: the tab is named **Directives**; sounds play on the **robot's host** (afplay on
+macOS, ffplay/aplay/mpg123/paplay elsewhere) so triggers work with no browser open; and the
+first slice **models both arms but drives one** — `arm_side` in settings says which of
+left/right the connected follower stands for, and an action that targets only the other
+side is skipped with a note in Activity. Rules written for both arms stay valid when the
+second arm arrives.
+
+Backend: `backend/directives/` (`store.py` SQLite + validation, `engine.py`, `audio.py`),
+endpoints `/poses`, `/sounds`, `/rules`, `/directives/*`, `PUT /recordings/{id}` (rename).
+Sounds live in `sounds/` (gitignored). Tested with fake arms: busy policies, cooldown, voice
+matching, object debounce, timers, arm skipping, plus an HTTP pass against temp storage.
+
+Not built yet / next:
+- **Second arm in the backend.** `robot` and `teleop` are single global controllers with one
+  port setting each. Real left+right needs a controller, port and calibration per arm, and
+  takes/poses/3D view keyed by side. Until then the other side is modelled, not driven.
+- Reusable **sequences** (a named action list rules can call), **state/modes** ("asleep")
+  that gate rules, import/export of rule sets, speak-text and LED actions.
+- Activity is an in-memory ring (400 events), cleared on restart.
+- Fold Manual / Pick calibration / Settings into a **Setup** area and make Dashboard the
+  visualisation home, once Directives has settled.
+
 ## Current Status Summary
 
 **Completed:**
