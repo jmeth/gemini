@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte'
   import { overlay } from '../../stores/ui'
+  import { wsConnected } from '../../stores/robot'
   import { vision, objectsFor, loadVision, setVision } from '../../stores/detection'
 
   export let label: string
@@ -69,6 +70,32 @@
     state = 'connecting'
     attempt += 1
   }
+
+  // The stream dies silently when the backend restarts (dev auto-reload, a crash):
+  // the <img> keeps its last frame and fires no error, so it just looks frozen and
+  // the backend, having lost its viewer, closes the camera. The shared /ws socket
+  // does notice the restart, so when it comes back, reattach.
+  let wasUp = $wsConnected
+  $: {
+    const up = $wsConnected
+    if (up && !wasUp && cameraIndex !== null) retry()
+    wasUp = up
+  }
+
+  // Backstop for any other way the stream can drop without telling the page: ask
+  // the backend whether anyone is still watching this camera.
+  let watchdog: ReturnType<typeof setInterval> | undefined
+  async function checkAlive() {
+    if (state !== 'live' || cameraIndex === null) return
+    try {
+      const res = await fetch('/camera/status')
+      if (!res.ok) return
+      const stream = (await res.json()).streams?.find((x: any) => x.index === cameraIndex)
+      if (!stream || !stream.open || stream.viewers === 0) retry()
+    } catch { /* backend unreachable: the /ws reconnect handles it when it returns */ }
+  }
+  onMount(() => { watchdog = setInterval(checkAlive, 4000) })
+  onDestroy(() => clearInterval(watchdog))
 
   function stop() {
     // Closes the HTTP connection; an MJPEG stream stays open otherwise.
