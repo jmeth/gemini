@@ -25,6 +25,8 @@ from backend.commands import registry as commands_registry
 from backend.commands.executor import match_command
 from backend.voice.listener import VoiceListener
 from backend.kinematics.chain import get_chain
+from backend.kinematics.fk import link_pose
+from backend.vision import table_map
 from backend.system.discovery import list_cameras, list_serial_ports
 from backend.vision.camera import CameraStream, manager as cameras
 from backend.vision.detector import detector
@@ -1142,6 +1144,164 @@ async def recordings_delete(rec_id: str):
     if not recorder.delete_recording(rec_id):
         return JSONResponse({"error": "Not found"}, status_code=404)
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Pick — camera pixel -> 3D point in the arm's base frame
+# ---------------------------------------------------------------------------
+# The arm is mounted tilted, so the table is not the arm's XY plane. The mapping
+# is learned from the arm itself: touch an object's centre with the gripper tip and
+# record its pixel next to the tip's position from forward kinematics. See
+# backend/vision/table_map.py for the method and its limits.
+
+_pick_points, _pick_table, _pick_camera = table_map.load()
+
+
+def _tool_state() -> tuple[list[float], list[float]]:
+    """Gripper tool point and finger direction in the base frame, from the follower."""
+    if not robot.status.connected or not robot.last_positions:
+        raise RuntimeError("Follower arm is not connected")
+    pose = link_pose(dict(robot.last_positions))
+    return pose[:3, 3].tolist(), pose[:3, 2].tolist()   # tool +Z runs along the fingers
+
+
+def _pick_refit() -> str | None:
+    """Refit after any change to the points. Returns why it could not, if it could not."""
+    global _pick_table
+    stream = cameras.get_detecting()
+    size = (stream.actual.get("width", 640), stream.actual.get("height", 480)) if stream else (
+        _pick_table.image_size if _pick_table else (640, 480))
+    if len(_pick_points) < table_map.MIN_POINTS:
+        _pick_table = None
+        table_map.save(_pick_points, None, _pick_camera)
+        return f"Need {table_map.MIN_POINTS - len(_pick_points)} more point(s)"
+    try:
+        _pick_table = table_map.fit(_pick_points, size)
+        err = None
+    except ValueError as exc:
+        _pick_table, err = None, str(exc)
+    table_map.save(_pick_points, _pick_table, _pick_camera)
+    return err
+
+
+def _pick_state(note: str | None = None) -> dict:
+    try:
+        tip, _ = _tool_state()
+    except RuntimeError:
+        tip = None
+    return {
+        "camera": _pick_camera,
+        "points": [{"pixel": list(p.pixel), "xyz": [round(v, 4) for v in p.xyz],
+                    "label": p.label} for p in _pick_points],
+        "solved": _pick_table is not None,
+        "table": _pick_table.to_dict() if _pick_table else None,
+        "tool": [round(v, 4) for v in tip] if tip else None,
+        "needed": table_map.MIN_POINTS,
+        "recommended": table_map.RECOMMENDED_POINTS,
+        "note": note,
+    }
+
+
+@app.get("/pick/calibration")
+async def pick_calibration():
+    return _pick_state()
+
+
+@app.post("/pick/calibration/point")
+async def pick_calibration_point(body: dict):
+    """
+    Record one touch: the gripper tip is on the table at the centre of an object.
+    Either names the object the detector sees now (track id / label; with only one
+    in view that is enough), or passes `pixel` — the object's centre captured
+    earlier, since the arm usually hides the object by the time it touches it.
+    """
+    global _pick_camera
+    stream = cameras.get_detecting()
+    if stream is None:
+        return JSONResponse({"error": "Turn object detection on first"}, status_code=400)
+    if _pick_points and _pick_camera is not None and _pick_camera != stream.index:
+        return JSONResponse(
+            {"error": f"Points were taken on camera {_pick_camera}; clear them to "
+                      f"calibrate camera {stream.index}"}, status_code=400)
+
+    # An explicit pixel is how the panel records a touch after the arm has covered
+    # the object: it locked the pixel while the object was still visible.
+    pixel = body.get("pixel")
+    label = body.get("label") if pixel is not None else None
+    if pixel is None:
+        dets = list(stream.last_detections)
+        if "track_id" in body:
+            dets = [d for d in dets if d.get("id") == body["track_id"]]
+        if body.get("label"):
+            dets = [d for d in dets if d.get("label") == body["label"]]
+        if not dets:
+            return JSONResponse({"error": "No matching object in view"}, status_code=400)
+        if len(dets) > 1:
+            ids = ", ".join(f"{d.get('label')}#{d.get('id')}" for d in dets)
+            return JSONResponse(
+                {"error": f"{len(dets)} objects in view ({ids}) — name one with track_id"},
+                status_code=400)
+        pixel, label = dets[0]["center"], dets[0].get("label")
+
+    try:
+        tip, approach = _tool_state()
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    _pick_camera = stream.index
+    _pick_points.append(table_map.CalibrationPoint(
+        tuple(float(v) for v in pixel), tuple(tip), label, tuple(approach)))
+    return _pick_state(_pick_refit())
+
+
+@app.delete("/pick/calibration/point/{index}")
+async def pick_calibration_delete_point(index: int):
+    if not 0 <= index < len(_pick_points):
+        return JSONResponse({"error": "No such point"}, status_code=404)
+    del _pick_points[index]
+    return _pick_state(_pick_refit())
+
+
+@app.post("/pick/calibration/clear")
+async def pick_calibration_clear():
+    global _pick_camera
+    _pick_points.clear()
+    _pick_camera = None
+    return _pick_state(_pick_refit())
+
+
+@app.get("/pick/objects")
+async def pick_objects(height: float = 0.0):
+    """
+    Everything the detector sees right now, with its position in the arm's base
+    frame (metres). `height` lifts the point that far off the table along its
+    normal, for objects whose bounding-box centre is above the surface.
+    """
+    if _pick_table is None:
+        return JSONResponse({"error": "Not calibrated — record touch points first"},
+                            status_code=409)
+    stream = cameras.get_detecting()
+    if stream is None or stream.index != _pick_camera:
+        return JSONResponse(
+            {"error": f"Detection must be running on camera {_pick_camera}"}, status_code=409)
+
+    size = (stream.actual.get("width", 640), stream.actual.get("height", 480))
+    out = []
+    for d in list(stream.last_detections):
+        try:
+            xyz = _pick_table.pixel_to_base(*d["center"], height=height, image_size=size)
+        except ValueError:
+            continue
+        out.append({
+            "id": d.get("id"), "label": d.get("label"), "conf": d.get("conf"),
+            "pixel": d["center"], "box": d["box"],
+            "xyz": [round(float(v), 4) for v in xyz],
+        })
+    return {
+        "frame": "base", "units": "m",
+        "table_normal": [round(float(v), 4) for v in _pick_table.normal],
+        "objects": out,
+    }
 
 
 # ---------------------------------------------------------------------------

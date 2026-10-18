@@ -244,8 +244,11 @@ GET  /vision/status            -> detector settings, live object count, model lo
 POST /vision/detect            -> {enabled?, camera?, fps?, conf?, imgsz?, classes?} toggle/tune detection
                                   (also broadcasts {type:"detections", camera, objects[], t} on /ws)
 
-POST /workspace/calibrate      -> {points: [{px, py, wx, wy}]} -> save homography
-POST /pick                     -> {label: str} or {px, py} -> execute IK pick
+GET  /pick/calibration         -> touch points, fit quality, live gripper tip
+POST /pick/calibration/point   -> {pixel, label?} or {track_id?} -> record one touch (tip xyz via FK)
+DELETE /pick/calibration/point/{i}, POST /pick/calibration/clear
+GET  /pick/objects             -> detections with xyz in the arm base frame (?height= lifts off the table)
+POST /pick                     -> {label: str} or {px, py} -> execute IK pick (not built)
 ```
 
 ## Recording File Format
@@ -345,11 +348,36 @@ POST /pick                     -> {label: str} or {px, py} -> execute IK pick
 - ✅ Live previews in the camera picker; stale indices flagged in the rig status
 - ✅ YOLO26n NCNN detector on backend — operator-toggled, slow refresh, lazy model load
 - ✅ Boxes + track ids drawn into the feed server-side; object data broadcast on /ws for later click-to-pick
-- ⏳ Workspace calibration: click 4 known points -> homography matrix saved
+- ✅ Table calibration (replaces the planned "click 4 known points" homography). The arm is
+     bolted to the side of a box at ~45 degrees, so the table is not the arm's XY plane.
+     Instead the table plane is measured in the arm's own frame: touch an object's centre with
+     the gripper tip, record its pixel next to the tip's FK position, repeat 8+ times. A plane
+     fitted to the tips is the table; a homography maps pixel -> position on that plane. Saved
+     to calibration/table_map.json. (backend/kinematics/fk.py, backend/vision/table_map.py,
+     Pick panel.) In simulation with a table tilted 45 degrees: ~1-3 mm with 8-12 points,
+     versus ~46 mm mean error if the table is assumed flat. Not yet validated on the real rig.
+- ✅ The object's pixel is locked BEFORE the arm moves in — the arm hides it from YOLO by the
+     time the tip arrives.
+- ✅ Camera feed reattaches after a backend restart (it used to freeze until a hard refresh).
+- ⏸ PAUSED — colored-dot calibration targets. Stick 8-12 matte, saturated dots (~15-20 mm,
+     a colour absent from the table and arm) across the pick area instead of using scissors:
+       * a dot has an unambiguous centre, so sub-pixel detection and no "where is the centre of
+         a pair of scissors" ambiguity between the box and the touch point (likely the largest
+         calibration error source with object boxes);
+       * scan every dot once with the arm out of the way, then touch them one by one — no
+         per-touch lock step, and the arm covering a dot no longer matters;
+       * the dots stay put, so recalibrating after a camera knock is a minute's work;
+       * does not depend on the COCO model.
+     Sketch: "Find dots" in the Pick panel (HSV threshold, keep round blobs of the right area,
+     centroids) -> list of dots -> pick one, guide the tip onto it, Record touch, mark done.
+     The same colour detector would also find coloured blocks for picking, which YOLO's 80 COCO
+     classes cannot. Open questions: dot colour/size, replace the object flow or sit beside it.
 
 ### Phase 5 — IK Pick-and-Place ⏳ PLANNED
-- ikpy chain from SO-101 URDF (so101_new_calib.urdf)
-- FK used to drive 3D arm viz (currently placeholder stick figure)
+- ✅ FK from the URDF (backend/kinematics/fk.py), same convention as the 3D viewer
+- ikpy chain from SO-101 URDF (so101_new_calib.urdf) for IK
+- Grasp orientation: a bounding box gives no angle, so scissors need a segmentation mask or
+  similar; the table normal from the calibration gives the approach direction
 - IK pick: world XYZ -> joint angles -> pre-approach / approach / grasp / lift
 - Click-or-voice pick dispatch from Pick panel
 

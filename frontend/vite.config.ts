@@ -22,6 +22,7 @@ export default defineConfig({
       '/recordings': 'http://localhost:8000',
       '/commands':   'http://localhost:8000',
       '/arcade':     'http://localhost:8000',
+      '/pick':       'http://localhost:8000',
     },
   },
   build: {

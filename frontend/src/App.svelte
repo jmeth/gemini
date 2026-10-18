@@ -4,7 +4,7 @@
   import { loadSettings } from './stores/settings'
   import { loadRanges } from './stores/ranges'
   import { startRigPolling, stopRigPolling } from './stores/rig'
-  import { mode, overlay, railOpen, MODE_PHASE } from './stores/ui'
+  import { mode, overlay, railOpen } from './stores/ui'
 
   import Header from './components/Header.svelte'
   import JointConsole from './components/JointConsole.svelte'
@@ -12,7 +12,7 @@
   import ManualPanel from './components/Modes/ManualPanel.svelte'
   import TeleopPanel from './components/Modes/TeleopPanel.svelte'
   import TeleopBar from './components/Modes/TeleopBar.svelte'
-  import PlaceholderPanel from './components/Modes/PlaceholderPanel.svelte'
+  import PickPanel from './components/Modes/PickPanel.svelte'
   import SettingsModal from './components/Settings/SettingsModal.svelte'
   import CalibrateModal from './components/Settings/CalibrateModal.svelte'
 
@@ -65,11 +65,7 @@
             {:else if $mode === 'teleop'}
               <TeleopPanel />
             {:else if $mode === 'pick'}
-              <PlaceholderPanel
-                label="Vision-guided picking"
-                phase={MODE_PHASE.pick}
-                detail="Needs camera streams and the IK chain. Configure a camera and its tile claims the stage."
-              />
+              <PickPanel />
             {/if}
           </div>
         {/if}
