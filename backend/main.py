@@ -321,6 +321,11 @@ async def robot_set_torque_all(body: dict):
         return JSONResponse({"error": "Not connected"}, status_code=400)
 
     loop = asyncio.get_event_loop()
+    if enabled and robot.last_positions:
+        # The goal register still holds the pose from before the arm was released
+        # (or dropped). Switching torque on cold would snap it back there, so hold
+        # where it is now first.
+        await robot.set_positions(dict(robot.last_positions))
     await loop.run_in_executor(None, robot._bus.set_torque_all, bool(enabled))
     return {"ok": True, "enabled": bool(enabled)}
 
