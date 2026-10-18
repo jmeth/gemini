@@ -233,6 +233,13 @@ async def get_ports():
     return list_serial_ports()
 
 
+# Probing must not open a camera that is already streaming.
+import backend.vision.devices as _camera_devices
+_camera_devices.busy_indices = lambda: [
+    i for i, st in list(cameras._streams.items()) if st.is_open
+]
+
+
 @app.get("/system/cameras")
 async def get_cameras():
     # Opening the picker rescans. Blocking probe, so off the event loop — it

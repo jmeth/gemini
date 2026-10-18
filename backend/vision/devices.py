@@ -84,19 +84,42 @@ def _list_linux() -> list[dict]:
     return found
 
 
+# Set by the app: returns the camera indices that are streaming right now.
+# Probing opens a device, and opening one that is already capturing is at best
+# wasted work and at worst disturbs the live stream, so those are not probed.
+busy_indices = None
+
+# Cameras need a moment after opening before the first frame arrives — a single
+# read() straight after open() fails on a perfectly good camera, which made it
+# look as if the device did not exist.
+PROBE_WARMUP_READS = 10
+PROBE_WARMUP_S = 0.1
+
+
 def _list_probing() -> list[dict]:
     """macOS and anything else without V4L2: fall back to opening indices."""
     import cv2
 
+    busy = set(busy_indices()) if busy_indices else set()
     found = []
     for idx in range(6):
+        entry = {"index": idx, "path": str(idx), "label": f"Camera {idx}", "driver": ""}
+        if idx in busy:
+            found.append(entry)      # streaming, so it plainly exists
+            continue
         cap = cv2.VideoCapture(idx)
         try:
-            if cap.isOpened() and cap.read()[0]:
-                found.append({
-                    "index": idx, "path": str(idx),
-                    "label": f"Camera {idx}", "driver": "",
-                })
+            if not cap.isOpened():
+                continue             # no such index
+            for _ in range(PROBE_WARMUP_READS):
+                if cap.read()[0]:
+                    break
+                time.sleep(PROBE_WARMUP_S)
+            else:
+                # The device opens but never yields a frame: present, but stuck or
+                # held by another app. Say so rather than pretend it is not there.
+                entry["label"] = f"Camera {idx} (not delivering frames)"
+            found.append(entry)
         finally:
             cap.release()
     return found
