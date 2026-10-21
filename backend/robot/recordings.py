@@ -161,6 +161,11 @@ class RecordingController:
                 )
             self._leader_cal = CalibrationStateMachine.load_calibration("leader")
 
+        # Both arms are about to be moved by hand: a leader still holding a pose
+        # would fight the operator, so let it go first.
+        if not teleop:
+            await self.release_leader()
+
         # By hand also means the follower must be free to move. Mirroring would
         # drive it against the operator's hands, and torque would hold it still.
         if not teleop:
@@ -499,11 +504,14 @@ class RecordingController:
                        leader_target: dict[str, float] | None = None,
                        duration: float | None = None) -> None:
         """Glide both arms from where they are now to the targets, at a bounded speed."""
+        if not target and not leader_target:
+            return
         current = {n: self._follower.last_positions.get(n) for n in target}
         known = {n: v for n, v in current.items() if v is not None}
         lknown = {n: self._leader_now[n] for n in (leader_target or {}) if n in self._leader_now}
         if not known and not lknown:
-            await self._follower.set_positions(self._clamp(target, cal))
+            if target:
+                await self._follower.set_positions(self._clamp(target, cal))
             return
         dist = max([abs(target[n] - v) for n, v in known.items()]
                    + [abs(leader_target[n] - v) for n, v in lknown.items()] + [0.0])
@@ -517,7 +525,8 @@ class RecordingController:
             f = f * f * (3.0 - 2.0 * f)   # smoothstep: no jolt at either end
             cmd = {n: (known[n] + (target[n] - known[n]) * f) if n in known else target[n]
                    for n in target}
-            await self._follower.set_positions(self._clamp(cmd, cal))
+            if cmd:
+                await self._follower.set_positions(self._clamp(cmd, cal))
             if leader_target:
                 await self._leader_write({
                     n: (lknown[n] + (leader_target[n] - lknown[n]) * f) if n in lknown
@@ -611,50 +620,94 @@ class RecordingController:
         p.write_text(json.dumps(doc, indent=2))
         return True
 
-    async def go_to(self, joints: dict[str, float], duration: float = 1.5,
-                    label: str | None = None) -> None:
+    def leader_up(self) -> bool:
+        return (self._teleop is not None and self._teleop.leader_bus is not None
+                and self._teleop.status.leader_connected)
+
+    async def go_to(self, joints: dict[str, float] | None, duration: float = 1.5,
+                    label: str | None = None,
+                    leader_joints: dict[str, float] | None = None) -> None:
         """
-        Move the follower to a pose and return once the move is under way. Shares
-        the playback slot, so it cannot overlap a take, and wait_idle() covers it.
+        Move the follower to `joints` and/or the leader to `leader_joints`, together, and
+        return once the move is under way. Shares the playback slot, so it cannot overlap a
+        take, and wait_idle() covers it.
+
+        The leader is powered for the move and left powered afterwards, holding the pose
+        (an arm that went limp would just fall). Whatever needs it passive again (teleop,
+        recording by hand, the E-stop) releases it.
         """
+        joints, leader_joints = joints or {}, leader_joints or {}
+        if not joints and not leader_joints:
+            raise RuntimeError("Nothing to move: no connected arm has values in this pose")
         if self.status.recording:
             raise RuntimeError("Stop recording before moving the arm")
         if self._play_task:
             raise RuntimeError("The arm is already moving")
-        if not self._follower.status.connected:
+        if joints and not self._follower.status.connected:
             raise RuntimeError("Follower arm not connected")
+        if leader_joints and not self.leader_up():
+            raise RuntimeError("Leader arm not connected")
 
         if self._teleop is not None and self._teleop.status.mirroring:
             await self._teleop.stop_mirroring()
+        loop = asyncio.get_event_loop()
         bus = getattr(self._follower, "_bus", None)
-        if bus is not None:
-            loop = asyncio.get_event_loop()
+        if joints and bus is not None:
             # Hold where the arm is before torque comes on, so a limp arm does not
             # snap to a stale goal on the way.
             if self._follower.last_positions:
                 await self._follower.set_positions(dict(self._follower.last_positions))
             await loop.run_in_executor(None, bus.set_torque_all, True)
+        if leader_joints:
+            await loop.run_in_executor(None, self._hold_and_energise_leader)
 
         self.status.playing = True
         self.status.play_id = label or "pose"
         self.status.play_progress = 0.0
         self.status.error = None
-        self._play_task = asyncio.get_event_loop().create_task(self._goto_loop(joints, duration))
+        self._play_task = loop.create_task(self._goto_loop(joints, duration, leader_joints))
 
-    async def _goto_loop(self, joints: dict[str, float], duration: float) -> None:
+    async def _goto_loop(self, joints: dict[str, float], duration: float,
+                         leader_joints: dict[str, float]) -> None:
         try:
             await self._ramp_to({n: v for n, v in joints.items() if n in MOTOR_NAMES},
-                                self._follower._calibration, duration=duration)
+                                self._follower._calibration,
+                                {n: v for n, v in leader_joints.items() if n in MOTOR_NAMES} or None,
+                                duration=duration)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.warning("Move to pose failed: %s", exc)
             self.status.error = str(exc)
+            if leader_joints:
+                self._release_leader()      # a failed move should not leave the arm powered
         finally:
             self.status.playing = False
             self.status.play_id = None
             self.status.play_progress = 1.0
             self._play_task = None
+
+    async def leader_powered(self) -> bool:
+        """Is the leader holding torque right now? Read from the servos, not remembered."""
+        if not self.leader_up():
+            return False
+        try:
+            torque = await asyncio.get_event_loop().run_in_executor(
+                None, self._teleop.leader_bus._locked_read, "Torque_Enable")
+            return any(torque.values())
+        except Exception:
+            return False
+
+    async def release_leader(self) -> None:
+        """Make the leader passive again so it can be moved by hand."""
+        if self.leader_up():
+            await asyncio.get_event_loop().run_in_executor(None, self._release_leader)
+
+    async def hold_leader(self) -> None:
+        """Power the leader where it is, so it holds its pose."""
+        if not self.leader_up():
+            raise RuntimeError("Leader arm is not connected")
+        await asyncio.get_event_loop().run_in_executor(None, self._hold_and_energise_leader)
 
     async def wait_idle(self) -> None:
         """Return when the current take or move has finished (immediately if none)."""
@@ -685,3 +738,4 @@ class RecordingController:
         await self.stop_play()
         if self._rec_task:
             await self.stop_recording()
+        await self.release_leader()

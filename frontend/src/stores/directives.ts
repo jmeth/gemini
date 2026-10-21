@@ -4,7 +4,18 @@ import { getJson } from './api'
 export type Side = 'left' | 'right'
 export const SIDES: Side[] = ['left', 'right']
 
-export interface ArmsInfo { sides: Side[]; side: Side; connected: boolean; audio_player: string | null }
+export interface ArmsInfo {
+  sides: Side[]
+  /** The side the follower port stands for; the leader port is the other. */
+  side: Side
+  leader_side: Side
+  follower_connected: boolean
+  leader_connected: boolean
+  /** The leader-port arm is holding torque (powered), not limp. */
+  leader_powered: boolean
+  connected: boolean
+  audio_player: string | null
+}
 export interface Pose {
   id: number; name: string; created_at: string
   arms: Partial<Record<Side, Record<string, number>>>
@@ -79,15 +90,30 @@ export async function setSide(side: Side) {
 }
 
 // -- poses
-export async function capturePose(name: string, poseId?: number) {
-  const d = await call('/poses/capture', 'POST', poseId ? { pose_id: poseId } : { name })
+/** Capture the arms' current positions. `sides` limits which; default is every connected arm. */
+export async function capturePose(name: string, poseId?: number, sides?: Side[]) {
+  const body: Record<string, unknown> = poseId ? { pose_id: poseId } : { name }
+  if (sides) body.sides = sides
+  const d = await call<Pose & { captured: Side[]; missing: Side[] }>('/poses/capture', 'POST', body)
   await loadPoses(); return d
 }
 export async function updatePose(id: number, patch: Partial<Pick<Pose, 'name' | 'arms'>>) {
   const d = await call(`/poses/${id}`, 'PUT', patch); await loadPoses(); return d
 }
 export async function deletePose(id: number) { await call(`/poses/${id}`, 'DELETE'); await loadPoses() }
-export const goToPose = (id: number, duration_s: number) => call(`/poses/${id}/go`, 'POST', { duration_s })
+/** Move every connected arm the pose has values for. Resolves with the sides that moved. */
+export async function goToPose(id: number, duration_s: number) {
+  const d = await call<{ ok: boolean; moved: Side[] }>(`/poses/${id}/go`, 'POST', { duration_s })
+  await loadArms()          // moving the leader-port arm leaves it powered
+  return d
+}
+
+/** Let the leader-port arm go limp again so it can be moved by hand (or hold it where it is). */
+export async function setLeaderTorque(enabled: boolean) {
+  const d = await call('/robot/torque/all?arm_name=leader', 'POST', { enabled })
+  await loadArms()
+  return d
+}
 
 // -- sounds
 export async function uploadSound(file: File, name: string) {

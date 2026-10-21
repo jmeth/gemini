@@ -338,11 +338,17 @@ async def robot_estop():
 
 
 @app.post("/robot/torque/all")
-async def robot_set_torque_all(body: dict):
+async def robot_set_torque_all(body: dict, arm_name: str = "follower"):
     """Re-arm (or release) every joint at once — how you recover from a stop."""
     enabled = body.get("enabled")
     if enabled is None:
         return JSONResponse({"error": "Missing enabled"}, status_code=400)
+    if arm_name == "leader":
+        try:
+            await (recorder.hold_leader() if enabled else recorder.release_leader())
+        except RuntimeError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return {"ok": True, "enabled": bool(enabled)}
     if not robot.status.connected or robot._bus is None:
         return JSONResponse({"error": "Not connected"}, status_code=400)
 
@@ -1376,13 +1382,27 @@ async def _rules_changed() -> None:
     await _run(voice.refresh_grammar)
 
 
+def _port_sides() -> dict[str, str]:
+    """
+    Which WALL-E side each physical arm stands for. `arm_side` names the side of the
+    follower port; the leader port is the other side.
+    """
+    follower = config.get().arm_side
+    return {"follower": follower, "leader": "left" if follower == "right" else "right"}
+
+
 @app.get("/directives/arms")
 async def directives_arms():
-    cfg = config.get()
+    sides = _port_sides()
+    leader_up = teleop.leader_bus is not None and teleop.status.leader_connected
     return {
         "sides": list(directives_store.SIDES),
-        "side": cfg.arm_side,                 # the arm the connected follower stands for
-        "connected": robot.status.connected,
+        "side": sides["follower"],            # the side the follower port stands for
+        "leader_side": sides["leader"],       # ...and the leader port
+        "connected": robot.status.connected,  # kept for older callers: the follower
+        "follower_connected": robot.status.connected,
+        "leader_connected": leader_up,
+        "leader_powered": await recorder.leader_powered(),   # holding a pose, not limp
         "audio_player": available_player(),
     }
 
@@ -1408,24 +1428,51 @@ async def poses_create(body: dict):
     return await _run(lambda: directives_store.create_pose(body.get("name", ""), body.get("arms", {})))
 
 
+async def _read_arms() -> dict[str, dict[str, float]]:
+    """Calibrated joint angles of every connected arm, keyed by the side it stands for."""
+    sides = _port_sides()
+    out: dict[str, dict[str, float]] = {}
+    if robot.status.connected and robot.last_positions:
+        out[sides["follower"]] = {n: round(v, 2) for n, v in robot.last_positions.items()}
+    bus = teleop.leader_bus
+    if bus is not None and teleop.status.leader_connected:
+        raw = await _run(bus.read_positions)
+        if raw:
+            cal = CalibrationStateMachine.load_calibration("leader")
+            out[sides["leader"]] = {
+                n: round(v + (cal.joints[n].zero_offset if n in cal.joints else 0.0), 2)
+                for n, v in raw.items()}
+    return out
+
+
 @app.post("/poses/capture")
 async def poses_capture(body: dict):
-    """Save where the connected arm is now. With pose_id, add this arm to that pose."""
-    if not robot.status.connected or not robot.last_positions:
-        return _bad(RuntimeError("Follower arm is not connected"))
-    side = config.get().arm_side
-    joints = {n: round(v, 2) for n, v in robot.last_positions.items()}
+    """
+    Save where the connected arms are now. `sides` picks which to capture (default:
+    every connected arm). With pose_id, add them to that pose, replacing any values it
+    already had for those sides.
+    """
+    now = await _read_arms()
+    wanted = [s for s in (body.get("sides") or list(now)) if s in directives_store.SIDES]
+    captured = {s: now[s] for s in wanted if s in now}
+    missing = [s for s in wanted if s not in now]
+    if not captured:
+        reason = (f"The {' and '.join(missing)} arm isn't connected" if missing
+                  else "No arm is connected")
+        return _bad(RuntimeError(reason))
 
     def save():
         if body.get("pose_id") is not None:
             existing = directives_store.get_pose(int(body["pose_id"]))
             if existing is None:
                 return None
-            return directives_store.update_pose(existing["id"], arms={**existing["arms"], side: joints})
-        return directives_store.create_pose(body.get("name", ""), {side: joints})
+            return directives_store.update_pose(existing["id"], arms={**existing["arms"], **captured})
+        return directives_store.create_pose(body.get("name", ""), captured)
 
     pose = await _run(save)
-    return pose if pose else JSONResponse({"error": "No such pose"}, status_code=404)
+    if not pose:
+        return JSONResponse({"error": "No such pose"}, status_code=404)
+    return {**pose, "captured": list(captured), "missing": missing}
 
 
 @app.put("/poses/{pose_id}")
@@ -1443,19 +1490,32 @@ async def poses_delete(pose_id: int):
 
 @app.post("/poses/{pose_id}/go")
 async def poses_go(pose_id: int, body: dict):
-    """Move the connected arm to a pose. The pose must have values for that arm."""
+    """
+    Move the arms to a pose: every connected arm the pose has values for, or just those
+    named in `sides`. The leader-port arm is powered and then left holding the pose.
+    """
     pose = await _run(lambda: directives_store.get_pose(pose_id))
     if pose is None:
         return JSONResponse({"error": "Not found"}, status_code=404)
-    side = config.get().arm_side
-    joints = pose["arms"].get(side)
-    if not joints:
-        return _bad(RuntimeError(f"This pose has no {side} arm values"))
+    sides = _port_sides()
+    wanted = [s for s in (body.get("sides") or directives_store.SIDES) if s in directives_store.SIDES]
+    follower_up = robot.status.connected
+    leader_up = recorder.leader_up()
+
+    follower_joints = pose["arms"].get(sides["follower"]) if sides["follower"] in wanted and follower_up else None
+    leader_joints = pose["arms"].get(sides["leader"]) if sides["leader"] in wanted and leader_up else None
+    if not follower_joints and not leader_joints:
+        have = ", ".join(pose["arms"]) or "no arm"
+        return _bad(RuntimeError(
+            f"Nothing to move: this pose has values for the {have} arm, and the matching arm "
+            f"isn't connected"))
     try:
-        await recorder.go_to(joints, float(body.get("duration_s", 1.5)), label=pose["name"])
+        await recorder.go_to(follower_joints, float(body.get("duration_s", 1.5)),
+                             label=pose["name"], leader_joints=leader_joints)
     except RuntimeError as exc:
         return _bad(exc)
-    return {"ok": True}
+    moved = ([sides["follower"]] if follower_joints else []) + ([sides["leader"]] if leader_joints else [])
+    return {"ok": True, "moved": moved}
 
 
 # -- sounds -----------------------------------------------------------------

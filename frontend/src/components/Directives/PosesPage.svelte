@@ -1,7 +1,7 @@
 <script lang="ts">
   import { isConnected } from '../../stores/robot'
   import {
-    poses, arms, SIDES, capturePose, updatePose, deletePose, goToPose, type Pose, type Side,
+    poses, arms, SIDES, capturePose, updatePose, deletePose, goToPose, setLeaderTorque, type Pose, type Side,
   } from '../../stores/directives'
 
   let name = ''
@@ -13,18 +13,41 @@
   let openId: number | null = null
   let note: string | null = null
 
-  $: side = $arms?.side ?? 'right'
+  // Which side each physical port stands for: the follower port is `side`, the
+  // leader port is the other one.
+  $: fSide = ($arms?.side ?? 'right') as Side
+  const portName = (s: Side) => (s === fSide ? 'follower port' : 'leader port')
+  const isUp = (s: Side) => (s === fSide ? $arms?.follower_connected : $arms?.leader_connected) ?? false
+
+  let pick: Record<Side, boolean> = { left: true, right: true }
+  $: toCapture = SIDES.filter(s => pick[s] && isUp(s))
+  $: anyUp = SIDES.some(isUp)
 
   async function capture() {
     busy = true
-    const ok = await capturePose(name.trim() || `Pose ${$poses.length + 1}`)
-    if (ok) { name = ''; note = `Saved the ${side} arm's position` }
+    const d = await capturePose(name.trim() || `Pose ${$poses.length + 1}`, undefined, toCapture)
+    if (d) { name = ''; note = `Saved the ${d.captured.join(' and ')} arm${d.captured.length > 1 ? 's' : ''}` }
     busy = false
   }
-  async function addArm(p: Pose) { busy = true; await capturePose('', p.id); busy = false }
+  async function addArm(p: Pose, s: Side) {
+    busy = true
+    const d = await capturePose('', p.id, [s])
+    if (d) note = `Added the ${s} arm to “${p.name}”`
+    busy = false
+  }
+  // The arms a pose would move right now: connected, and the pose has values for them.
+  const movers = (p: Pose) => SIDES.filter(s => p.arms[s] && isUp(s))
+  $: lSide = ($arms?.leader_side ?? 'left') as Side
+
   async function go(p: Pose) {
     busy = true
-    note = (await goToPose(p.id, duration)) ? `Moving to “${p.name}”` : null
+    const d = await goToPose(p.id, duration)
+    note = d ? `Moving the ${d.moved.join(' and ')} arm${d.moved.length > 1 ? 's' : ''} to “${p.name}”` : null
+    busy = false
+  }
+  async function releaseLeader() {
+    busy = true
+    if (await setLeaderTorque(false)) note = `The ${lSide} arm is limp again — move it by hand`
     busy = false
   }
   async function remove(id: number) {
@@ -49,17 +72,37 @@
 </div>
 
 <div class="card">
-  <span class="label">Capture the {side} arm's current position</span>
+  <span class="label">Capture the arms' current positions</span>
+  <div class="row picks">
+    {#each SIDES as s}
+      <label class="pick" class:down={!isUp(s)}>
+        <input type="checkbox" bind:checked={pick[s]} disabled={!isUp(s)} />
+        <span class="cap">{s === 'left' ? 'Left' : 'Right'} arm</span>
+        <span class="chip" class:off={!isUp(s)}>{portName(s)} · {isUp(s) ? 'connected' : 'not connected'}</span>
+      </label>
+    {/each}
+  </div>
   <div class="row">
     <input class="text grow" placeholder="Name (e.g. arms up)" bind:value={name}
-      on:keydown={(e) => e.key === 'Enter' && $isConnected && capture()} />
-    <button class="btn pri" on:click={capture} disabled={!$isConnected || busy}>Capture pose</button>
+      on:keydown={(e) => e.key === 'Enter' && toCapture.length && capture()} />
+    <button class="btn pri" on:click={capture} disabled={!toCapture.length || busy}>
+      Capture {toCapture.length === 2 ? 'both arms' : toCapture.length === 1 ? `${toCapture[0]} arm` : 'pose'}
+    </button>
   </div>
   <span class="small">
-    {#if !$isConnected}Connect the follower arm to capture.
-    {:else}Tip: release the arm on the Manual tab, pose it by hand, then capture.{/if}
+    {#if !anyUp}Connect an arm to capture.
+    {:else}The follower port is the <b>{fSide}</b> arm and the leader port is the <b>{fSide === 'left' ? 'right' : 'left'}</b> arm
+      — change this with “Follower port is” in the sidebar. Release an arm on the Manual tab to pose it by hand.{/if}
   </span>
 </div>
+
+{#if $arms?.leader_powered}
+  <div class="holding" role="status">
+    <span>The <b>{lSide}</b> arm is powered and holding its pose. It stays that way until you release it,
+      start teleop, or record by hand.</span>
+    <button class="btn sm" on:click={releaseLeader} disabled={busy}>Release {lSide} arm</button>
+  </div>
+{/if}
 
 <div class="row between">
   <span class="label">Saved poses</span>
@@ -90,12 +133,16 @@
               </button>
             </span>
           </div>
-          {#if !p.arms[side]}
-            <button class="btn sm" on:click={() => addArm(p)} disabled={!$isConnected || busy}
-              title="Save the {side} arm's current position into this pose">+ {side} arm</button>
-          {/if}
-          <button class="btn sm pri" on:click={() => go(p)} disabled={!$isConnected || busy || !p.arms[side]}
-            title={p.arms[side] ? 'Move the connected arm to this pose' : `No ${side} arm values in this pose`}>Go</button>
+          {#each SIDES as s}
+            {#if !p.arms[s] && isUp(s)}
+              <button class="btn sm" on:click={() => addArm(p, s)} disabled={busy}
+                title="Save the {s} arm's current position into this pose">+ {s} arm</button>
+            {/if}
+          {/each}
+          <button class="btn sm pri" on:click={() => go(p)} disabled={busy || movers(p).length === 0}
+            title={movers(p).length ? `Move the ${movers(p).join(' and ')} arm${movers(p).length > 1 ? 's' : ''} to this pose`
+                                    : 'No connected arm has values in this pose'}>
+            Go{movers(p).length === 2 ? ' · both' : ''}</button>
           {#if editId === p.id}
             <button class="btn sm" on:click={() => commitRename(p.id)}>Save</button>
           {:else}
@@ -128,5 +175,14 @@
   .full { flex-wrap: nowrap; }
   .vals { display: flex; flex-direction: column; gap: 5px; padding: 8px 10px; background: #0d1013; border-radius: 4px; }
   .vals div { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+  .holding {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+    font-size: 12px; line-height: 1.5; color: #b89a5a; background: #2a2113;
+    border: 1px solid #4a3a1c; border-radius: 6px; padding: 9px 12px;
+  }
+  .picks { gap: 18px; }
+  .pick { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+  .pick.down { opacity: 0.6; cursor: default; }
+  .cap { font-size: 13px; color: #dfe6ec; }
   .link { background: none; border: none; padding: 0; color: #45c3d1; font-family: inherit; font-size: 11.5px; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
 </style>

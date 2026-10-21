@@ -53,14 +53,17 @@
     {/each}
 
     <div class="arm">
-      <span class="armlabel">Connected arm</span>
-      <div class="seg" role="group" aria-label="Which arm is connected">
+      <span class="armlabel">Follower port is the</span>
+      <div class="seg" role="group" aria-label="Which side the follower port is">
         {#each SIDES as s}
           <button class:on={$arms?.side === s} on:click={() => setSide(s)}
-            title="The follower on the USB port is WALL·E's {s} arm">{s === 'left' ? 'Left' : 'Right'}</button>
+            title="The arm on the follower port is WALL·E's {s} arm">{s === 'left' ? 'Left' : 'Right'}</button>
         {/each}
       </div>
-      <span class="armnote">Rules can target both arms. Only this one moves for now; the other is skipped.</span>
+      <span class="armnote">
+        …so the leader port is the {$arms?.leader_side ?? 'other'} arm.
+        Poses capture both; rules can target either or both.
+      </span>
     </div>
   </nav>
 

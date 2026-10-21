@@ -172,6 +172,10 @@ class TeleopController:
         if self._task:
             return  # Already running
 
+        # Mirroring reads the leader, so it must be passive. A pose may have left it
+        # powered and holding, which would fight the hand driving it.
+        await asyncio.get_event_loop().run_in_executor(None, self._leader_bus.set_torque_all, False)
+
         self.status.mirroring = True
         self.status.clutched = False
         self.status.error = None

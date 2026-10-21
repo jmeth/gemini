@@ -235,23 +235,38 @@ class DirectivesEngine:
                 self.log("action", f"Wait {a['seconds']:g}s", rule_id=rule["id"])
                 await asyncio.sleep(a["seconds"])
 
-    def _targets(self, rule: dict, a: dict, what: str) -> bool:
-        """Is the connected arm one this action targets? Logs why not if it isn't."""
-        side = self._side()
-        if side in a["arms"]:
-            others = [s for s in a["arms"] if s != side]
-            if others:
-                self.log("skip", f"{what}: {', '.join(others)} arm not connected — playing {side} only",
-                         rule_id=rule["id"])
-            return True
-        self.log("skip", f"{what} skipped — it targets {', '.join(a['arms'])}, "
-                         f"but the connected arm is {side}", rule_id=rule["id"])
-        return False
+    def _connected(self) -> dict[str, str]:
+        """{side: role} for each arm that is actually plugged in and ready."""
+        follower = self._side()
+        leader = "left" if follower == "right" else "right"
+        out: dict[str, str] = {}
+        if self._rec._follower.status.connected:
+            out[follower] = "follower"
+        if self._rec.leader_up():
+            out[leader] = "leader"
+        return out
+
+    def _targets(self, rule: dict, a: dict, what: str) -> dict[str, str]:
+        """
+        The connected arms this action targets, as {side: role}. Logs why any other arm it
+        names is left out (not plugged in), or that nothing it names is connected at all.
+        """
+        connected = self._connected()
+        hit = {s: connected[s] for s in a["arms"] if s in connected}
+        missing = [s for s in a["arms"] if s not in connected]
+        if not hit:
+            self.log("skip", f"{what} skipped — it targets {', '.join(a['arms'])}, "
+                             f"but only {', '.join(connected) or 'no arm'} is connected",
+                     rule_id=rule["id"])
+        elif missing:
+            self.log("skip", f"{what}: {', '.join(missing)} arm not connected — "
+                             f"using {', '.join(hit)} only", rule_id=rule["id"])
+        return hit
 
     async def _movement(self, rule: dict, a: dict) -> None:
         label = f"Movement “{self._take_name(a['id'])}”"
         if not self._targets(rule, a, label):
-            return
+            return        # a take drives whichever arms are connected, for its whole length
         self.log("action", f"{label} (×{a['speed']:g})", rule_id=rule["id"])
         await self._rec.play(a["id"], a["speed"])
         await self._rec.wait_idle()
@@ -262,15 +277,21 @@ class DirectivesEngine:
         if pose is None:
             raise RuntimeError("that pose has been deleted")
         label = f"Pose “{pose['name']}”"
-        if not self._targets(rule, a, label):
-            return
-        joints = pose["arms"].get(self._side())
+        hit = self._targets(rule, a, label)
+        joints: dict[str, dict] = {}
+        for side, role in hit.items():
+            values = pose["arms"].get(side)
+            if values:
+                joints[role] = values
+            else:
+                self.log("skip", f"{label}: no {side} arm values — that arm stays put",
+                         rule_id=rule["id"])
         if not joints:
-            self.log("skip", f"{label} skipped — it has no {self._side()} arm values",
-                     rule_id=rule["id"])
             return
-        self.log("action", f"{label} over {a['duration_s']:g}s", rule_id=rule["id"])
-        await self._rec.go_to(joints, a["duration_s"], label=pose["name"])
+        moving = ", ".join(s for s, r in hit.items() if r in joints)
+        self.log("action", f"{label} · {moving} over {a['duration_s']:g}s", rule_id=rule["id"])
+        await self._rec.go_to(joints.get("follower"), a["duration_s"], label=pose["name"],
+                              leader_joints=joints.get("leader"))
         await self._rec.wait_idle()
 
     async def _sound(self, rule: dict, a: dict) -> None:
