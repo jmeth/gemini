@@ -539,7 +539,7 @@ async def robot_arms():
 
 
 @app.post("/robot/calibrate/start")
-async def calibrate_start(arm_name: str = "follower"):
+async def calibrate_start(arm_name: str = "follower", joints: str = ""):
     """Begin calibration. Torque is released on that arm so joints move by hand."""
     if arm_name not in ARMS:
         return JSONResponse({"error": f"Unknown arm '{arm_name}'"}, status_code=400)
@@ -560,8 +560,14 @@ async def calibrate_start(arm_name: str = "follower"):
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, bus.set_torque_all, False)
 
-    calibrations[arm_name] = CalibrationStateMachine(arm_name=arm_name)
-    return calibrations[arm_name].start()
+    wanted = [j.strip() for j in joints.split(",") if j.strip()] or None
+    machine = CalibrationStateMachine(arm_name=arm_name)
+    try:
+        status = machine.start(wanted)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    calibrations[arm_name] = machine
+    return status
 
 
 @app.get("/robot/calibrate/position")
@@ -628,6 +634,13 @@ async def calibrate_confirm(arm_name: str = "follower"):
     status = calibration.confirm(raw_pos)
 
     if status.get("step") == "complete":
+        # The servos clamp every command to their own angle limits. If those are
+        # tighter than the range just recorded, the joint stops short whenever it is
+        # driven (a leader gripper that cannot close, say). Widen them to cover it.
+        # Torque is still off here, which the EEPROM write needs.
+        calibration.limits_report = await loop.run_in_executor(
+            None, _widen_servo_limits, bus, calibration)
+        status = calibration.get_status()
         # The follower holds position again; the leader must stay passive so it
         # can still be moved by hand for teleop.
         if arm_name == "follower":
@@ -669,6 +682,27 @@ async def calibrate_cancel(arm_name: str = "follower"):
     return await calibrate_status(arm_name)
 
 
+def _widen_servo_limits(bus, calibration) -> dict:
+    """Widen the servo limits of each calibrated joint to cover its recorded range."""
+    report: dict[str, dict] = {}
+    for motor in calibration._order:
+        extent = calibration.raw_extent(motor)
+        if extent is None:
+            continue
+        try:
+            changed = bus.widen_angle_limits(motor, *extent)
+        except Exception as exc:
+            logger.warning("Could not check %s's servo limits: %s", motor, exc)
+            report[motor] = {"error": str(exc)}
+            continue
+        if changed:
+            to_deg = lambda t: round(t * 360.0 / 4096, 1)
+            report[motor] = {side: {"was": to_deg(old), "now": to_deg(new)}
+                             for side, (old, new) in changed.items()}
+            logger.info("Widened %s servo limits: %s", motor, report[motor])
+    return report
+
+
 @app.get("/robot/calibrate/status")
 async def calibrate_status(arm_name: str = "follower"):
     """Get current calibration state."""
@@ -704,8 +738,14 @@ async def calibrate_ranges(arm_name: str = "follower"):
 
 
 @app.post("/robot/home")
-async def robot_home():
+async def robot_home(arm_name: str = "follower"):
     """Move all joints to saved home position."""
+    if arm_name == "leader":
+        # The leader is passive; this powers it just long enough to reach home.
+        try:
+            return await recorder.leader_home()
+        except RuntimeError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
     if not robot.status.connected:
         return JSONResponse({"error": "Not connected"}, status_code=400)
 

@@ -2,6 +2,7 @@
   import { onMount, onDestroy } from 'svelte'
   import { loadRig } from '../../stores/rig'
   import { loadRanges } from '../../stores/ranges'
+  import { MOTOR_NAMES } from '../../stores/robot'
 
   interface CalibrationStatus {
     active: boolean
@@ -9,6 +10,10 @@
     motor: string | null
     progress: [number, number]
     instruction: string
+    joints?: string[]
+    /** Set when a run completes: the ranges it produced, and what changed in the servos. */
+    result?: Record<string, { min: number; max: number; zero_offset: number }>
+    limits?: Record<string, any>
   }
 
   interface Arm {
@@ -86,8 +91,17 @@
     }
   }
 
+  // Which joints the next run covers. Recalibrating one joint keeps the others.
+  let chosen: string[] = [...MOTOR_NAMES]
+  $: partial = chosen.length > 0 && chosen.length < MOTOR_NAMES.length
+
+  function toggleJoint(n: string) {
+    chosen = chosen.includes(n) ? chosen.filter(x => x !== n) : [...chosen, n]
+  }
+
   async function start() {
-    await post(`/robot/calibrate/start?arm_name=${armName}`)
+    const only = partial ? `&joints=${chosen.join(',')}` : ''
+    await post(`/robot/calibrate/start?arm_name=${armName}${only}`)
     await refresh()
   }
 
@@ -126,7 +140,7 @@
   // A finished run still reports active, but nothing is in progress — the picker
   // and Start button must come back so the other arm (or a redo) can be run.
   $: running = status.active && status.step !== 'complete'
-  $: canStart = !!selected?.connected && !running
+  $: canStart = !!selected?.connected && !running && chosen.length > 0
 </script>
 
 <div class="panel">
@@ -167,7 +181,26 @@
         Connect it from the <em>{selected.name}</em> dot in the header first.
       </p>
     {:else if selected?.calibrated && !running}
-      <p class="hint">Running this again replaces {selected.label}'s saved calibration.</p>
+      <p class="hint">
+        {partial ? `Recalibrates only the joints chosen below; ${selected.label}'s other joints and its saved home keep their values.`
+                 : `Running this again replaces ${selected.label}'s saved calibration.`}
+      </p>
+    {/if}
+
+    {#if !running}
+      <div class="joints">
+        <span class="field-label">Joints to calibrate</span>
+        <div class="joint-chips">
+          {#each MOTOR_NAMES as n}
+            <button class="jchip" class:on={chosen.includes(n)} aria-pressed={chosen.includes(n)}
+              on:click={() => toggleJoint(n)}>{n.replace('_', ' ')}</button>
+          {/each}
+        </div>
+        <div class="joint-quick">
+          <button class="linkbtn" on:click={() => (chosen = [...MOTOR_NAMES])}>all joints</button>
+          <button class="linkbtn" on:click={() => (chosen = ['gripper'])}>gripper only</button>
+        </div>
+      </div>
     {/if}
   </div>
 
@@ -216,6 +249,30 @@
       </button>
     {/if}
   </div>
+
+  {#if status.step === 'complete' && status.result}
+    <div class="outcome" role="status">
+      <strong>Calibrated range</strong>
+      {#each Object.entries(status.result) as [joint, r]}
+        <div class="orow"><span>{joint.replace('_', ' ')}</span><span>{r.min}° … {r.max}°</span></div>
+      {/each}
+      {#each Object.entries(status.limits ?? {}) as [joint, l]}
+        <div class="olimit">
+          {#if l.error}
+            Could not check {joint.replace('_', ' ')}'s servo limits: {l.error}
+          {:else}
+            Widened {joint.replace('_', ' ')}'s servo limit
+            {#if l.min}(low end {l.min.was}° → {l.min.now}°){/if}
+            {#if l.max}(high end {l.max.was}° → {l.max.now}°){/if}
+            so it can reach the range above.
+          {/if}
+        </div>
+      {/each}
+      {#if status.limits && Object.keys(status.limits).length === 0}
+        <div class="olimit dim">The servos' own limits already cover this range.</div>
+      {/if}
+    </div>
+  {/if}
 
   <div class="help-text">
     <strong>How it works:</strong>
@@ -273,6 +330,30 @@
     border-radius: 4px; padding: 8px 10px;
   }
   .hint { font-size: 11.5px; line-height: 1.5; color: #55606a; }
+
+  .joints { display: flex; flex-direction: column; gap: 6px; margin-top: 2px; }
+  .joint-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+  .jchip {
+    font-family: inherit; font-size: 11.5px; text-transform: capitalize; cursor: pointer;
+    color: #7c8892; background: #0d1013; border: 1px solid #262d34; border-radius: 4px; padding: 4px 9px;
+  }
+  .jchip:hover { color: #dfe6ec; }
+  .jchip.on { color: #9fe1ea; background: #13343a; border-color: #1f5560; }
+  .jchip:focus-visible, .linkbtn:focus-visible { outline: 2px solid #45c3d1; outline-offset: 1px; }
+  .joint-quick { display: flex; gap: 12px; }
+  .linkbtn {
+    background: none; border: none; padding: 0; cursor: pointer; font-family: inherit;
+    font-size: 11px; color: #45c3d1; text-decoration: underline; text-underline-offset: 2px;
+  }
+
+  .outcome {
+    display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: #b6c0c8;
+    background: #0d1013; border: 1px solid #1d2329; border-radius: 6px; padding: 10px 12px;
+  }
+  .outcome strong { font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: #55606a; font-weight: 600; }
+  .orow { display: flex; justify-content: space-between; text-transform: capitalize; }
+  .olimit { font-size: 11.5px; line-height: 1.5; color: #d8a442; }
+  .olimit.dim { color: #55606a; }
   .position-value.dim { color: #55606a; }
   .error-note {
     font-size: 11.5px; line-height: 1.45; color: #e2564a;

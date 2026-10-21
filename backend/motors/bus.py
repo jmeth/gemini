@@ -264,6 +264,42 @@ class FeetechBus:
                                self._packet_handler.getTxRxResult(result))
             writer.clearParam()
 
+    def widen_angle_limits(self, motor_name: str, lo_deg: float, hi_deg: float,
+                           margin_deg: float = 2.0) -> dict:
+        """
+        Make sure the servo's own angle limits (EEPROM) cover lo_deg..hi_deg, raw.
+
+        A servo clamps every commanded position to these limits, so a limit tighter
+        than the range the joint really travels makes it stop short whenever it is
+        driven. This only ever widens: a limit already wide enough is left alone,
+        and nothing is ever narrowed. Returns {"min": (old, new), "max": (old, new)}
+        in ticks for whatever changed, or {} if nothing needed to.
+
+        EEPROM writes need the joint's torque off, which is true of an arm that is
+        being calibrated.
+        """
+        if not self._connected:
+            raise RuntimeError("Not connected")
+        mid = MOTOR_IDS[motor_name]
+        ticks = lambda deg: deg * RESOLUTION / 360.0
+        want_min = max(0, int(ticks(lo_deg - margin_deg)))
+        want_max = min(RESOLUTION - 1, int(ticks(hi_deg + margin_deg)) + 1)
+
+        with self._lock:
+            cur_min = self._sync_read("Min_Angle_Limit").get(motor_name)
+            cur_max = self._sync_read("Max_Angle_Limit").get(motor_name)
+            if cur_min is None or cur_max is None:
+                raise RuntimeError(f"Could not read {motor_name}'s angle limits")
+            changed = {}
+            self._write(mid, "Lock", 0)
+            if want_min < cur_min:
+                self._write(mid, "Min_Angle_Limit", want_min)
+                changed["min"] = (cur_min, want_min)
+            if want_max > cur_max:
+                self._write(mid, "Max_Angle_Limit", want_max)
+                changed["max"] = (cur_max, want_max)
+        return changed
+
     def configure_responsive(self) -> None:
         """
         Make the follower track commands promptly.

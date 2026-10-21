@@ -119,24 +119,52 @@ class CalibrationStateMachine:
         self._min_raw: dict[str, float] = {}
         self._max_raw: dict[str, float] = {}
 
-        # Final calibration data
+        # The joints this run covers, in order. All of them by default; a run can
+        # cover a subset (say, just a gripper whose range was wrong).
+        self._order: list[str] = list(MOTOR_NAMES)
+        # Zero offsets before this run, so a joint's saved home can be carried over
+        # to the same physical pose once its zero moves.
+        self._old_offsets: dict[str, float] = {}
+        self._had_calibration = False
+        # What was done to the servos' own angle limits when the run finished.
+        self.limits_report: dict[str, dict] = {}
+
+        # Final calibration data. Joints this run does not cover keep what they had.
         self.data = CalibrationData.default()
 
     @property
     def current_motor(self) -> Optional[str]:
         """Name of motor currently being calibrated."""
-        if 0 <= self.current_joint_idx < len(MOTOR_NAMES):
-            return MOTOR_NAMES[self.current_joint_idx]
+        if 0 <= self.current_joint_idx < len(self._order):
+            return self._order[self.current_joint_idx]
         return None
 
     @property
     def progress(self) -> tuple[int, int]:
         """Returns (current joint number, total joints)."""
-        return (self.current_joint_idx + 1, len(MOTOR_NAMES))
+        return (self.current_joint_idx + 1, len(self._order))
 
-    def start(self) -> dict:
-        """Begin calibration sequence."""
-        logger.info("Starting calibration")
+    def start(self, joints: list[str] | None = None) -> dict:
+        """
+        Begin a calibration run over `joints` (default: all six). Joints outside the
+        run keep their saved calibration, and saved home positions are preserved.
+        """
+        if joints is not None:
+            unknown = [j for j in joints if j not in MOTOR_NAMES]
+            if unknown:
+                raise ValueError(f"Unknown joint(s): {', '.join(unknown)}")
+            order = [n for n in MOTOR_NAMES if n in joints]
+            if not order:
+                raise ValueError("Choose at least one joint to calibrate")
+        else:
+            order = list(MOTOR_NAMES)
+
+        logger.info("Starting calibration of %s", ", ".join(order))
+        self._order = order
+        self._had_calibration = find_calibration_file(self.arm_name) is not None
+        self.data = self.load_calibration(self.arm_name)
+        self._old_offsets = {n: self.data.joints[n].zero_offset for n in order if n in self.data.joints}
+        self.limits_report = {}
         self.step = CalibrationStep.MIN_POSITION
         self.current_joint_idx = 0
         self.current_joint = self.current_motor
@@ -176,7 +204,7 @@ class CalibrationStateMachine:
 
             # Move to next joint or finish
             self.current_joint_idx += 1
-            if self.current_joint_idx >= len(MOTOR_NAMES):
+            if self.current_joint_idx >= len(self._order):
                 self._finish()
             else:
                 self.current_joint = self.current_motor
@@ -203,6 +231,13 @@ class CalibrationStateMachine:
             max_pos=max_calibrated
         )
 
+        # Home is stored in calibrated degrees, which are relative to the zero that
+        # just moved. Re-express it so it still names the same physical pose.
+        old_offset = self._old_offsets.get(motor)
+        if self._had_calibration and old_offset is not None and motor in self.data.home_positions:
+            self.data.home_positions[motor] = round(
+                self.data.home_positions[motor] - old_offset + zero_offset, 1)
+
     def _finish(self):
         """Complete calibration and save to file."""
         self.step = CalibrationStep.COMPLETE
@@ -219,13 +254,30 @@ class CalibrationStateMachine:
 
     def get_status(self) -> dict:
         """Return current calibration state for UI."""
-        return {
+        status = {
             "active": self.step != CalibrationStep.IDLE,
             "step": self.step.value,
             "motor": self.current_motor,
             "progress": self.progress,
+            "joints": list(self._order),
             "instruction": self._get_instruction(),
         }
+        if self.step == CalibrationStep.COMPLETE:
+            # What this run produced, and what was done to the servos' own limits.
+            status["result"] = {
+                n: {"min": round(self.data.joints[n].min_pos, 1),
+                    "max": round(self.data.joints[n].max_pos, 1),
+                    "zero_offset": round(self.data.joints[n].zero_offset, 1)}
+                for n in self._order if n in self.data.joints}
+            status["limits"] = self.limits_report
+        return status
+
+    def raw_extent(self, motor: str) -> tuple[float, float] | None:
+        """Lowest and highest raw angle recorded for a joint in this run, in degrees."""
+        if motor not in self._min_raw or motor not in self._max_raw:
+            return None
+        a, b = self._min_raw[motor], self._max_raw[motor]
+        return (min(a, b), max(a, b))
 
     def _get_instruction(self) -> str:
         """Get instruction text for current step."""

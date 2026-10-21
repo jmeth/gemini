@@ -421,6 +421,45 @@ class RecordingController:
             for n, v in raw.items()
         }
 
+    async def leader_home(self, hold_s: float = 1.0) -> dict:
+        """
+        Drive the leader arm to its saved home pose, hold briefly, then let it go
+        passive again. Returns what was commanded and where each joint actually
+        ended up, so a joint that cannot reach its target shows up in the numbers.
+        """
+        if self._teleop is None or self._teleop.leader_bus is None \
+                or not self._teleop.status.leader_connected:
+            raise RuntimeError("Leader arm is not connected")
+        if self.status.recording or self._play_task:
+            raise RuntimeError("Wait for the current recording or movement to finish")
+        if self._teleop.status.mirroring:
+            raise RuntimeError("Stop teleop mirroring first")
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._hold_and_energise_leader)
+        try:
+            home = {n: v for n, v in self._leader_cal.home_positions.items() if n in MOTOR_NAMES}
+            start = dict(self._leader_now)
+            dist = max((abs(home[n] - start[n]) for n in home if n in start), default=0.0)
+            duration = max(RAMP_MIN_S, dist / RAMP_DEG_PER_S)
+            t0 = time.monotonic()
+            while True:
+                f = min(1.0, (time.monotonic() - t0) / duration)
+                f = f * f * (3.0 - 2.0 * f)
+                await self._leader_write({n: start[n] + (home[n] - start[n]) * f if n in start else home[n]
+                                          for n in home})
+                if f >= 1.0:
+                    break
+                await asyncio.sleep(PLAYBACK_INTERVAL)
+            await asyncio.sleep(hold_s)
+            raw = await loop.run_in_executor(None, self._teleop.leader_bus.read_positions)
+            reached = {n: round(v + (self._leader_cal.joints[n].zero_offset
+                                     if n in self._leader_cal.joints else 0.0), 1)
+                       for n, v in raw.items()}
+        finally:
+            self._release_leader()
+        return {"commanded": {n: round(v, 1) for n, v in home.items()}, "reached": reached}
+
     def _release_leader(self) -> None:
         """Back to passive, so the leader can be moved by hand for teleop."""
         bus = self._teleop.leader_bus if self._teleop is not None else None
