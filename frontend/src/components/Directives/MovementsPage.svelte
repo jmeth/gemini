@@ -51,7 +51,9 @@
   <h2>Movements</h2>
   <p class="lede">
     Record the arm moving, name it, and replay it. Rules play movements as actions.
-    Takes are tagged with the arm they were recorded on.
+    The chips show which arms a take moves. Replaying a take drives <b>both</b> arms for its
+    whole duration, so an arm that stayed still while recording is held at its recorded pose.
+    Your left arm is the leader hardware, and your right arm is the follower.
   </p>
 </div>
 
@@ -96,8 +98,8 @@
           {/if}
           <span class="small">
             {t.duration_s}s · {ago(t.created_at)}
-            {#if t.side}<span class="chip">{t.side} arm</span>{/if}
-            {#if t.leader}<span class="chip amber" title="This take also captured the leader arm">+ leader</span>{/if}
+            {#each t.moves ?? [] as s}<span class="chip">{s} arm</span>{/each}
+            {#if t.moves && t.moves.length === 0}<span class="chip off" title="No arm travelled far enough to count as moving">no motion</span>{/if}
           </span>
         </div>
         {#if st.play_id === t.id}

@@ -48,6 +48,8 @@ PLAYBACK_INTERVAL = 1.0 / PLAYBACK_HZ
 # the follower was holding position the whole time (teleop not mirroring, torque
 # not released). Saved anyway, but flagged so it doesn't fail silently.
 STATIC_SPAN_DEG = 1.5
+# A recorded arm counts as part of a take only if some joint travels at least this far.
+MOVED_DEG = 3.0
 
 # Playback skips the idle lead-in of a take: it starts where the first joint
 # moves more than this far from the take's opening pose. Smaller than that is
@@ -314,7 +316,29 @@ class RecordingController:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def list_recordings() -> list[dict]:
+    def _moves(frames: list[dict], follower_side: str) -> list[str]:
+        """
+        Which arms a take actually moves, as WALL-E sides. The follower track belongs to
+        `follower_side` and the leader track to the other, and a track only counts if
+        it travels further than noise (a take that holds one arm still is not a take of
+        that arm, however much of it was recorded).
+        """
+        if not frames:
+            return []
+        swing = lambda vals: (max(vals) - min(vals)) if vals else 0.0
+        follower = max((swing([f[n] for f in frames if n in f]) for n in MOTOR_NAMES), default=0.0)
+        leader = max((swing([f["leader"][n] for f in frames if n in f.get("leader", {})])
+                      for n in MOTOR_NAMES), default=0.0)
+        other = "left" if follower_side == "right" else "right"
+        moved = []
+        if follower >= MOVED_DEG:
+            moved.append(follower_side)
+        if leader >= MOVED_DEG:
+            moved.append(other)
+        return sorted(moved)
+
+    @staticmethod
+    def list_recordings(follower_side: str = "right") -> list[dict]:
         if not RECORDINGS_DIR.exists():
             return []
         out: list[dict] = []
@@ -333,6 +357,7 @@ class RecordingController:
                 "frames": len(d.get("frames", [])),
                 "leader": bool(d.get("frames")) and "leader" in d["frames"][0],
                 "side": d.get("side"),
+                "moves": RecordingController._moves(d.get("frames", []), follower_side),
             })
         out.sort(key=lambda r: r.get("created_at") or "", reverse=True)
         return out

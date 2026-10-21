@@ -440,6 +440,14 @@ Not built yet / next:
 - Reusable **sequences** (a named action list rules can call), **state/modes** ("asleep")
   that gate rules, import/export of rule sets, speak-text and LED actions.
 - Activity is an in-memory ring (400 events), cleared on restart.
+- **Playback drives both arms** for a take's whole duration, by choice: it keeps one-arm and
+  two-arm takes the same. An arm that stood still while recording is held at its recorded
+  pose, and a rule's per-action arm choice only decides whether the connected arm is skipped.
+  Later: play only the arms a take moves (`moves` is already reported per take) and honour a
+  rule's arm selection per track.
+- Wiring, for the record: the **left** arm is the leader hardware (lower-torque motors, port
+  `5A68…`); the **right** arm is the follower hardware (higher-torque, port `5AAF…`).
+  `arm_side` is the side of the follower port, so it is `right`.
 - Fold Manual / Pick calibration / Settings into a **Setup** area and make Dashboard the
   visualisation home, once Directives has settled.
 

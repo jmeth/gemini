@@ -1140,7 +1140,7 @@ async def vision_detect(body: dict):
 
 @app.get("/recordings")
 async def recordings_list():
-    return RecordingController.list_recordings()
+    return RecordingController.list_recordings(config.get().arm_side)
 
 
 @app.get("/recordings/status")

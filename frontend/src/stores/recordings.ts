@@ -11,6 +11,8 @@ export interface Take {
   /** Which WALL-E arm the take was recorded on, and whether the leader was captured too. */
   side?: string | null
   leader?: boolean
+  /** The arms (left/right) this take actually moves, for the current wiring. */
+  moves?: string[]
 }
 
 export interface RecorderStatus {
